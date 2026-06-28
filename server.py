@@ -48,7 +48,49 @@ _rag: RAGPipeline | None = None
 _init_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jama-job")
 
-mcp = FastMCP("jama-mcp")
+# Server-level instructions sent to the LLM client alongside the tool list.
+# This is the canonical MCP way to steer tool selection: it tells the model
+# to DEFAULT to fusion retrieval and only fall back to native metadata for
+# precise pointers, so fuzzy/keyword/natural-language questions always hit
+# the hybrid (FTS5 BM25 + sqlite-vec + RRF + rerank) path.
+JAMA_MCP_INSTRUCTIONS = """\
+Jama MCP — tool selection guide (read before choosing a tool)
+
+DEFAULT TO FUSION SEARCH. For any question that is not a precise lookup,
+call `search_jama_semantics`. It already fuses three retrieval signals in
+one call — keyword (FTS5/BM25), vector (sqlite-vec cosine) and RRF — then
+reranks with a local Qwen3 model. So "like", "keyword" and "semantic"
+queries are ALL best answered by this single tool. Use it for:
+  • natural-language questions      ("how does volume sync work")
+  • partial / fuzzy matches         ("something about login timeout")
+  • topical / concept searches      ("test cases for payment flow")
+  • "find items mentioning …"       (free-text containment)
+
+USE NATIVE METADATA ONLY FOR PRECISE POINTERS. Reach for the structured
+tools below when the user gives an exact, unambiguous key — not a topic:
+  • `query_jama_native_metadata` — exact document_key (e.g. "SA-TC-7"),
+    exact status ("BLOCKED"), or exact item_type filter on a project.
+  • `get_jama_item`              — a specific numeric item id.
+  • `get_jama_item_children` / `get_jama_item_relationships` /
+    `get_jama_item_comments` / `get_jama_item_attachments` — drill into
+    one known item id.
+  • `list_jama_projects` / `list_jama_releases` / `list_jama_test_runs` /
+    `list_jama_item_types` — enumerate, not search.
+
+ROUTING RULE OF THUMB: if the user's intent can be expressed as a search
+box query → `search_jama_semantics`. If it is "show me item X" or "list
+all Y" → the native/browse tools. When unsure, prefer fusion search; it
+is召回-oriented and surfaces the most relevant items even for near-keyword
+phrasing, while native tools return empty on any misspelling or mismatch.
+
+PREREQUISITE: `search_jama_semantics` needs the project initialized first
+(`init_jama_project` → poll `get_sync_progress` until DONE). The native
+and browse tools work immediately against the live Jama API — no init
+required. If a project is not initialized, suggest `init_jama_project`
+before falling back to native metadata.
+"""
+
+mcp = FastMCP("jama-mcp", instructions=JAMA_MCP_INSTRUCTIONS)
 
 
 def db() -> "sqlite3.Connection":  # type: ignore[name-defined]
@@ -292,6 +334,12 @@ def search_jama_semantics(project_id: str, query: str,
                           modified_before: str = None) -> dict:
     """Semantic search over an initialized Jama project using high-precision RAG.
 
+    This is the DEFAULT tool for any non-precise question. It fuses keyword
+    (FTS5/BM25), vector (sqlite-vec cosine) and RRF in one call, then reranks
+    with a local Qwen3 model — so "like", "keyword" and "semantic" queries are
+    all best answered here. Prefer it over native metadata unless the user
+    gives an exact document key / status / item id.
+
     Pipeline: Multi-Query expansion -> hybrid recall (sqlite-vec + FTS5) ->
     RRF fusion -> local Qwen3-Reranker-0.6B -> top_k results.
 
@@ -372,6 +420,10 @@ def query_jama_native_metadata(project_id: str, document_key: str = None,
                                item_type: int = None, status: str = None,
                                keyword: str = None) -> dict:
     """Query Jama's native REST API directly for exact metadata filtering.
+
+    Use ONLY for precise lookups (exact document key, exact status, exact
+    item_type) — it returns empty on any misspelling. For topical, fuzzy or
+    natural-language questions, prefer `search_jama_semantics` instead.
 
     Bypasses the vector store to answer precise questions (exact document key,
     specific status, specific item type). Handles pagination internally and
