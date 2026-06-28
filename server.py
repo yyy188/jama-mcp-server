@@ -199,20 +199,33 @@ def _sync_project(project_id: int, *, job_id: str | None,
         upsert_project(conn, project_id, status="ERROR", error=msg)
         return
 
-    # Concurrent streaming fetch + batched index.
+    # Pipelined fetch + index: download and embed run in PARALLEL on two
+    # threads, communicating through a bounded queue. The old interleaved
+    # design fetched a wave, then STOPPED fetching while it embedded (8s/batch
+    # of dead download time). Pipelining lets the downloader keep filling the
+    # queue while the embedder consumes it, so overall throughput rises from
+    # "serial alternation" (~1 item/s measured) to "max(download, embed)"
+    # (~5 item/s, embedding-bound).
     #
-    # Page 1 of the fetch reports the server-side total via on_total, so we
-    # don't need a separate probe request. Pages are then fetched in waves of
-    # `download_concurrency` parallel requests (borrowed from a prior impl:
-    # Jama caps pages at 50 and has no bulk-get, so serial pagination is the
-    # download bottleneck on large projects). As each wave arrives we chunk
-    # the items and accumulate chunks across items into embedding-sized pools;
-    # when a pool fills we flush (embed with concurrent batch requests + store).
+    # CRASH SAFETY: `done`/`progress` and the per-item DB writes only ever
+    # advance in the EMBED thread, AFTER the SQLite commit succeeds. So a crash
+    # at any point leaves the DB consistent up to the last committed batch; the
+    # project stays INITIALIZING and `_resume_interrupted_syncs` re-queues a
+    # full resync (upsert is idempotent, so already-indexed items are just
+    # overwritten — no duplicates, no lost data). Items sitting in the queue at
+    # crash time were never written, so they're simply re-fetched on resume.
+    import queue
+    import threading
     pipeline = rag()
     max_items = settings.sync.max_items_per_run if incremental else None
     dl_concurrency = settings.sync.download_concurrency
     batch_size = settings.embedding.batch_size
     total_holder: list[int] = [0]  # set by on_total callback
+    # Bounded queue: caps memory at ~2 batches of items in flight. Small bound
+    # so a crash never loses much unwritten work, and so the downloader
+    # backpressures naturally when the embedder falls behind.
+    item_queue: "queue.Queue[tuple[dict, list[dict]] | None]" = queue.Queue(maxsize=batch_size * 4)
+    fetch_error: list[BaseException] = []
 
     def _on_total(n: int) -> None:
         total_holder[0] = n
@@ -221,25 +234,54 @@ def _sync_project(project_id: int, *, job_id: str | None,
                        message=f"Indexing {n} top-level items "
                                f"(Test Runs/Folders/Attachments excluded)")
 
-    pending: list[tuple[dict, list[dict]]] = []  # (item, chunks) awaiting embed
-    pending_chunk_count = 0
+    def _fetcher() -> None:
+        """Download thread: pull items concurrently, chunk them, enqueue."""
+        try:
+            for item in client.iter_project_items(
+                    project_id, modified_after=last_sync,
+                    max_items=max_items, concurrency=dl_concurrency,
+                    on_total=_on_total):
+                try:
+                    chunks = chunk_item(item)
+                except Exception as exc:
+                    log.warning("Failed to chunk item %s: %s",
+                                item.get("item_id"), exc)
+                    chunks = []
+                # Items with no text still need metadata persisted + stale
+                # chunks cleared; enqueue them so the embed thread handles
+                # them uniformly (empty chunk list => upsert-only).
+                item_queue.put((item, chunks))
+        except BaseException as exc:
+            fetch_error.append(exc)
+        finally:
+            item_queue.put(None)  # sentinel: no more items
+
     done = 0
     chunk_total = 0
 
-    def _flush_pending() -> None:
-        """Embed + store all accumulated chunks in packed (concurrent) batches."""
-        nonlocal chunk_total
-        if not pending:
+    def _embed_and_store(batch: list[tuple[dict, list[dict]]]) -> None:
+        """Embed one batch of items and commit to SQLite (embed thread)."""
+        nonlocal done, chunk_total
+        # Split into text-bearing items (need embedding) and empty ones.
+        to_embed: list[tuple[dict, list[dict]]] = []
+        for item, chunks in batch:
+            if chunks:
+                to_embed.append((item, chunks))
+            else:
+                with write_txn(conn):
+                    upsert_item(conn, item)
+                replace_chunks(conn, item["item_id"], [], [])
+                done += 1
+        if not to_embed:
             return
         flat: list[dict] = []
-        owners: list[tuple[dict, list[dict]]] = []  # (item, its chunks) aligned
-        for item, chunks in pending:
+        owners: list[tuple[dict, list[dict]]] = []
+        for item, chunks in to_embed:
             owners.append((item, chunks))
             flat.extend(chunks)
         # embed_many packs flat into batch_size HTTP requests across items,
         # fired concurrently (EMBEDDING_CONCURRENCY).
         embeddings = pipeline.embed_many(flat)
-        # Write each item's metadata + its chunks in one go.
         idx = 0
         for item, chunks in owners:
             n = len(chunks)
@@ -253,41 +295,53 @@ def _sync_project(project_id: int, *, job_id: str | None,
             except Exception as exc:
                 log.warning("Failed to index item %s: %s",
                             item.get("item_id"), exc)
-        pending.clear()
-        pending_chunk_count = 0
+            done += 1
 
+    # Start the download thread.
+    fetch_thread = threading.Thread(target=_fetcher, daemon=True,
+                                    name="jama-fetch")
+    fetch_thread.start()
+
+    # Embed thread (main thread): consume the queue, accumulate into
+    # batch_size chunk pools, flush when full. This is the only place `done`
+    # and the DB advance, preserving the crash-safety invariant.
+    pending: list[tuple[dict, list[dict]]] = []
+    pending_chunk_count = 0
     total = total_holder[0]
-    for item in client.iter_project_items(
-            project_id, modified_after=last_sync, max_items=max_items,
-            concurrency=dl_concurrency, on_total=_on_total):
+    while True:
+        entry = item_queue.get()
+        if entry is None:
+            break  # sentinel from fetcher
+        item, chunks = entry
+        pending.append((item, chunks))
+        pending_chunk_count += len(chunks)
         total = total_holder[0] or total
-        try:
-            chunks = chunk_item(item)
-            if chunks:
-                pending.append((item, chunks))
-                pending_chunk_count += len(chunks)
-            else:
-                # No text: persist metadata + clear any stale chunks.
-                with write_txn(conn):
-                    upsert_item(conn, item)
-                replace_chunks(conn, item["item_id"], [], [])
-        except Exception as exc:
-            log.warning("Failed to chunk item %s: %s", item.get("item_id"), exc)
-        done += 1
-        # Flush when the pending chunk pool reaches an embedding batch. This
-        # keeps memory bounded and packs each HTTP request to capacity. Each
-        # flush commits to SQLite, so a crash mid-sync loses at most the
-        # in-flight pool (< batch_size chunks), never the whole project.
         if pending_chunk_count >= batch_size:
-            _flush_pending()
-        if job_id:
-            pct = round(done / total, 4) if total else 0.0
-            update_job(conn, job_id, done=done, progress=pct,
-                       message=f"Indexed {done}/{total or '?'} items")
+            _embed_and_store(pending)
+            pending.clear()
+            pending_chunk_count = 0
+            if job_id:
+                pct = round(done / total, 4) if total else 0.0
+                update_job(conn, job_id, done=done, progress=pct,
+                           message=f"Indexed {done}/{total or '?'} items")
 
     # Flush any trailing partial batch.
-    _flush_pending()
+    if pending:
+        _embed_and_store(pending)
+        pending.clear()
     total = total_holder[0] or total
+    fetch_thread.join(timeout=5)
+
+    # Surface any error from the fetcher thread (e.g. Jama auth failure mid-sync).
+    if fetch_error:
+        exc = fetch_error[0]
+        msg = f"Fetch failed: {exc}"
+        log.error("Sync fetch thread failed for project %s: %s", project_id, exc)
+        if job_id:
+            update_job(conn, job_id, status="ERROR", message=msg)
+        upsert_project(conn, project_id, name=proj_name, status="ERROR",
+                       error=str(exc)[:500])
+        raise exc
 
     if done == 0:
         if job_id:
