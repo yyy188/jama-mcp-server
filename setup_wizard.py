@@ -18,7 +18,7 @@ from typing import Callable
 # Ensure project root on sys.path so `import config` works when run from anywhere.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import (PROJECT_ROOT, OPTIONAL_VARS, REQUIRED_VARS,  # noqa: E402
+from config import (PROJECT_ROOT, OPTIONAL_VARS, _required_vars,  # noqa: E402
                     reload_settings, settings, write_env_file)
 
 
@@ -141,7 +141,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.non_interactive:
-        values = {k: os.environ.get(k, "") for k, *_ in REQUIRED_VARS + OPTIONAL_VARS}
+        values = {k: os.environ.get(k, "") for k, *_ in _required_vars() + OPTIONAL_VARS}
     else:
         values = _collect()
 

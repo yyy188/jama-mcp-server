@@ -39,6 +39,12 @@ _OPTIONAL_DEPS = [
     ("torch", "local Qwen3 reranker"),
 ]
 
+# Provider-specific embedding deps. Only required for the active provider.
+_PROVIDER_DEPS = {
+    "local": [("fastembed", "local CPU embedding (bge-small-en-v1.5)")],
+    "azure": [],  # azure uses requests, already in _CORE_DEPS
+}
+
 
 def _try_import(name: str) -> tuple[bool, str]:
     try:
@@ -68,6 +74,14 @@ def check_dependencies() -> dict[str, Any]:
         checked += 1
         if not ok:
             missing_optional.append({"package": name, "purpose": purpose, "error": err})
+    # The active embedding provider has its own required deps. fastembed is
+    # CORE for local (no embedding works without it); azure only needs requests.
+    provider = settings.embedding.provider
+    for name, purpose in _PROVIDER_DEPS.get(provider, []):
+        ok, err = _try_import(name)
+        checked += 1
+        if not ok:
+            missing_core.append({"package": name, "purpose": purpose, "error": err})
     return {
         "ok": not missing_core,
         "missing_core": missing_core,

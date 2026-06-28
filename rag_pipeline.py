@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 from typing import Any
@@ -232,6 +233,219 @@ class EmbeddingClient:
                     out[start + j] = e
         # All positions filled (batches are contiguous); cast away None.
         return [v for v in out if v is not None]
+
+
+# --------------------------------------------------------------------------- #
+# Local embedding client (bge-small-en-v1.5 on CPU via fastembed / ONNX)
+# --------------------------------------------------------------------------- #
+# bge-small-en-v1.5 query prefix. The v1.5 model was trained so the prefix is
+# "not so necessary", but adding it for the query side still measurably helps
+# retrieval recall against documents indexed without the prefix. Documents are
+# embedded raw; only queries get the prefix.
+_BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
+
+class LocalEmbeddingClient:
+    """CPU-only local embedding via fastembed (bge-small-en-v1.5, ONNX).
+
+    Production-grade characteristics:
+      * **Lazy singleton load** — the ~130MB ONNX model loads on first embed,
+        never at import, so server startup is fast and a missing model never
+        blocks MCP serving.
+      * **Model presence check + mirrored download** — if the model isn't
+        cached, download it. China mirror (hf-mirror.com) is tried first with
+        a pre-flight speed test; if too slow or unreachable, fall back to the
+        global HuggingFace endpoint; if that's also too slow, abort with a
+        clear error instead of hanging for hours.
+      * **CPU cap** — ONNX runtime threads are capped at ``cpu_percent`` of the
+        system's cores (default 60%) so the MCP server and scheduler keep
+        headroom on a shared host.
+      * **Thread-safe** — a lock serialises embed calls because the underlying
+        ONNX session is not re-entrant-safe for concurrent forward passes on
+        the same instance.
+      * **Graceful failure** — a load error is sticky; subsequent calls return
+        the same error rather than retrying on every request.
+    """
+
+    _instance: "LocalEmbeddingClient | None" = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+
+    def __init__(self):
+        if getattr(self, "_initialized", False):
+            return
+        self._initialized = True
+        self._cfg = settings.embedding
+        self._model = None  # fastembed.TextEmbedding, lazy
+        self._load_error: str | None = None
+        self._embed_lock = threading.Lock()
+
+    # ----- model loading + download ------------------------------------- #
+    def _thread_count(self) -> int:
+        """ONNX threads = ceil(cpu_count * cpu_percent / 100), min 1."""
+        import math
+        cores = os.cpu_count() or 4
+        return max(1, math.ceil(cores * self._cfg.cpu_percent / 100))
+
+    def _cache_dir(self) -> str:
+        """fastembed cache root — project-local user/huggingface for portability."""
+        from config import USER_DIR
+        return os.environ.get("HF_HOME", str(USER_DIR / "huggingface"))
+
+    def _model_present(self) -> bool:
+        """True if the bge-small-en-v1.5 ONNX model is already cached locally."""
+        # fastembed stores models under <cache>/models--<org>--<name>. We check
+        # for the snapshot dir with the ONNX file present.
+        model = self._cfg.local_model
+        repo_dir = "models--" + model.replace("/", "--")
+        base = os.path.join(self._cache_dir(), "models", model)
+        # fastembed uses a slightly different layout: <cache>/models/<org>/<name>
+        # and also <cache>/models--<org>--<name>. Probe both.
+        candidates = [
+            os.path.join(self._cache_dir(), "models", model),
+            os.path.join(self._cache_dir(), repo_dir),
+        ]
+        for c in candidates:
+            if os.path.isdir(c):
+                for dirpath, _dirs, files in os.walk(c):
+                    if any(f.endswith(".onnx") for f in files):
+                        return True
+        return False
+
+    def _download_model(self) -> None:
+        """Download the model via fastembed, China mirror first then global.
+
+        Sets ``HF_ENDPOINT`` to the mirror before invoking fastembed (which uses
+        huggingface_hub under the hood and honours that env var). Runs a
+        pre-flight speed test against the mirror; if it's below the configured
+        floor or unreachable, switches to the global endpoint and retries. If
+        both fail, raises ``RuntimeError`` with an actionable message.
+        """
+        from net_guard import speed_test, NetworkTooSlowError
+        from fastembed import TextEmbedding
+
+        # fastembed downloads the ONNX model from a Qdrant-published repo, not
+        # the original BAAI repo. Resolve the real HF source so the speed-test
+        # probe hits a file that actually exists.
+        model_meta = next(
+            (m for m in TextEmbedding.list_supported_models()
+             if m["model"] == self._cfg.local_model), None)
+        hf_repo = (model_meta or {}).get("sources", {}).get("hf", self._cfg.local_model)
+        model_file = (model_meta or {}).get("model_file", "model_optimized.onnx")
+
+        mirrors = [
+            ("China mirror", "https://hf-mirror.com"),
+            ("HuggingFace (global)", "https://huggingface.co"),
+        ]
+        min_bps = self._cfg.download_min_bps
+        # Probe URL for the speed test: a small file from the ONNX model repo.
+        probe_path = f"{hf_repo}/resolve/main/config.json"
+
+        last_err: str | None = None
+        for label, endpoint in mirrors:
+            os.environ["HF_ENDPOINT"] = endpoint
+            probe_url = f"{endpoint}/{probe_path}"
+            try:
+                bps = speed_test(probe_url, min_bytes_per_sec=min_bps,
+                                 timeout=20, label=f"emb-{label}")
+                log.info("Embedding model mirror %s OK: %.0f bytes/s", label, bps)
+            except NetworkTooSlowError as exc:
+                last_err = f"{label} ({endpoint}): {exc}"
+                log.warning("Embedding mirror %s too slow/unreachable: %s",
+                            label, exc)
+                continue
+            # Mirror is fast enough — trigger the actual download by
+            # constructing TextEmbedding (it downloads on first use).
+            try:
+                log.info("Downloading %s (ONNX from %s) via %s ...",
+                         self._cfg.local_model, hf_repo, label)
+                te = TextEmbedding(
+                    model_name=self._cfg.local_model,
+                    cache_dir=self._cache_dir(),
+                    threads=self._thread_count(),
+                    cuda=False,
+                )
+                # Force the actual model load (download + ONNX init) now so a
+                # download failure surfaces here, not on the first embed.
+                _ = list(te.embed(["warmup"], batch_size=1))
+                self._model = te
+                log.info("Local embedding model ready (%s, %d CPU threads).",
+                         self._cfg.local_model, self._thread_count())
+                return
+            except Exception as exc:
+                last_err = f"{label} download failed: {exc}"
+                log.warning("Embedding download from %s failed: %s", label, exc)
+                continue
+
+        # Both mirrors failed.
+        self._load_error = (
+            f"Could not download embedding model {self._cfg.local_model} "
+            f"(ONNX source {hf_repo}/{model_file}) from any mirror. "
+            f"Last error: {last_err}. Check network connectivity or "
+            f"pre-download the model manually into {self._cache_dir()}.")
+        raise RuntimeError(self._load_error)
+
+    def _load(self) -> bool:
+        """Load the model (cached or freshly downloaded). True on success."""
+        if self._model is not None:
+            return True
+        if self._load_error is not None:
+            return False
+        try:
+            if self._model_present():
+                log.info("Loading cached local embedding model %s ...",
+                         self._cfg.local_model)
+                from fastembed import TextEmbedding
+                self._model = TextEmbedding(
+                    model_name=self._cfg.local_model,
+                    cache_dir=self._cache_dir(),
+                    threads=self._thread_count(),
+                    cuda=False,
+                )
+                _ = list(self._model.embed(["warmup"], batch_size=1))
+                log.info("Local embedding model ready (%d CPU threads).",
+                         self._thread_count())
+                return True
+            self._download_model()
+            return self._model is not None
+        except Exception as exc:
+            self._load_error = str(exc)
+            log.error("Local embedding model unavailable: %s", exc)
+            return False
+
+    # ----- embed API (mirrors EmbeddingClient) ------------------------- #
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Embed a batch of document texts (no query prefix)."""
+        if not texts:
+            return []
+        if not self._load():
+            raise RuntimeError(f"Local embedding unavailable: {self._load_error}")
+        out: list[list[float]] = []
+        with self._embed_lock:
+            for i in range(0, len(texts), self._cfg.batch_size):
+                batch = texts[i:i + self._cfg.batch_size]
+                for vec in self._model.embed(batch,
+                                             batch_size=self._cfg.batch_size):
+                    out.append([float(x) for x in vec])
+        return out
+
+    def embed_one(self, text: str) -> list[float]:
+        """Embed a single query (with the bge query prefix for better recall)."""
+        return self.embed_texts([_BGE_QUERY_PREFIX + text])[0]
+
+    def embed_many_concurrent(self, texts: list[str],
+                              concurrency: int = 1) -> list[list[float]]:
+        """Embed a large document list. Local is CPU-bound so concurrency is
+        ignored — a single ONNX session already saturates the capped threads,
+        and parallel sessions would oversubscribe the CPU. Serial batched embed
+        is the correct and fastest path here."""
+        return self.embed_texts(texts)
 
 
 # --------------------------------------------------------------------------- #
@@ -511,7 +725,13 @@ class QwenReranker:
 # --------------------------------------------------------------------------- #
 class RAGPipeline:
     def __init__(self) -> None:
-        self.embedder = EmbeddingClient()
+        # Pick the embedding backend by provider: local (CPU bge) or azure
+        # (OpenAI-compatible API). Both expose the same embed_texts /
+        # embed_one / embed_many_concurrent surface.
+        if settings.embedding.provider == "local":
+            self.embedder = LocalEmbeddingClient()
+        else:
+            self.embedder = EmbeddingClient()
         self.expander = MultiQueryExpander(n=3)
         self.reranker = QwenReranker()
 

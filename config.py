@@ -86,26 +86,55 @@ class JamaSettings:
 
 @dataclass(frozen=True)
 class EmbeddingSettings:
-    """OpenAI-compatible text embedding endpoint (Azure gateway here)."""
+    """Embedding configuration.
+
+    Two providers are supported:
+      * ``local`` (default) — runs bge-small-en-v1.5 on CPU via fastembed/ONNX.
+        No API key, no network at query time; the model is downloaded once
+        (China mirror first, then HuggingFace, then abort). CPU usage is capped
+        at ``cpu_percent`` of the system's cores.
+      * ``azure`` — calls an OpenAI-compatible embedding endpoint (Azure
+        gateway). Requires base_url + api_key; every embed is a network round
+        trip.
+    """
+    # "local" (CPU bge-small-en) or "azure" (OpenAI-compatible API endpoint).
+    provider: str = _get("EMBEDDING_PROVIDER", "local")
+    # --- local provider settings ---
+    local_model: str = _get("EMBEDDING_LOCAL_MODEL", "BAAI/bge-small-en-v1.5")
+    # Cap CPU threads used by the ONNX runtime at this % of system cores.
+    # 60% leaves headroom for the MCP server + scheduler on a shared host.
+    cpu_percent: int = _get_int("EMBEDDING_CPU_PERCENT", 60)
+    # Minimum download throughput (bytes/s) for the model mirror speed test.
+    # bge-small-en-v1.5 is ~67MB; at 200KB/s that's ~5min — acceptable.
+    download_min_bps: int = _get_int("EMBEDDING_DOWNLOAD_MIN_BPS", 200_000)
+    # --- azure provider settings ---
     base_url: str = _get("EMBEDDING_BASE_URL", "https://your-embedding-endpoint.example.com")
     api_key: str = _get("EMBEDDING_API_KEY", _get("OPENAI_API_KEY", ""))
     model: str = _get("EMBEDDING_MODEL", "text-embedding-3-small")
-    # text-embedding-3-small == 1536 dims.
-    dimensions: int = _get_int("EMBEDDING_DIMENSIONS", 1536)
-    # Texts per embedding HTTP request. Benchmarked on a real Azure
-    # text-embedding-3-small gateway: batch=32 outperforms 64/128 because the
-    # gateway's per-request processing cost grows super-linearly with input
-    # count, while HTTP round-trip cost is small. 32 is the measured sweet spot.
-    batch_size: int = _get_int("EMBEDDING_BATCH_SIZE", 32)
-    timeout: int = _get_int("EMBEDDING_TIMEOUT", 60)
     # Header used to carry the key (Azure uses "api-key", OpenAI uses "Authorization").
     key_header: str = _get("EMBEDDING_KEY_HEADER", "api-key")
-    # Concurrent embedding HTTP requests during bulk indexing. Benchmarked:
-    # the Azure gateway has internal request queuing, so high concurrency
-    # (4-8) is SLOWER than low concurrency (2-3) — parallel requests queue
-    # server-side. 2 gives a small speedup over serial without triggering
-    # queuing. Lower = safer if you see 429s.
+    timeout: int = _get_int("EMBEDDING_TIMEOUT", 60)
+    # --- shared settings ---
+    # Texts per embedding batch. For local CPU, 32 keeps latency low while
+    # giving ONNX enough work for good thread utilisation. For azure, 32 was
+    # the measured sweet spot (gateway per-request cost grows super-linearly).
+    batch_size: int = _get_int("EMBEDDING_BATCH_SIZE", 32)
+    # Concurrent embedding requests. Local is CPU-bound so concurrency just
+    # thrashes — forced to 1. For azure, 2 avoids the gateway's server-side
+    # queuing that makes high concurrency slower.
     concurrency: int = _get_int("EMBEDDING_CONCURRENCY", 2)
+
+    @property
+    def dimensions(self) -> int:
+        """Embedding vector dimensionality, derived from the provider.
+
+        local bge-small-en-v1.5 == 384; azure text-embedding-3-small == 1536
+        (overridable via EMBEDDING_DIMENSIONS). Changing providers changes
+        dimensions, which triggers a vec-index rebuild in db_setup.init_db.
+        """
+        if self.provider == "local":
+            return 384  # bge-small-en-v1.5
+        return _get_int("EMBEDDING_DIMENSIONS", 1536)
 
 
 @dataclass(frozen=True)
@@ -204,11 +233,14 @@ settings = Settings()
 # --------------------------------------------------------------------------- #
 # (var, human label, which feature needs it). Required vars block every tool
 # that talks to Jama or the embedding endpoint; optional ones only gate the
-# features that use them.
-REQUIRED_VARS = [
+# features that use them. The embedding API vars are only required when
+# EMBEDDING_PROVIDER=azure; local (CPU bge) needs no API credentials.
+REQUIRED_VARS_JAMA = [
     ("JAMA_URL", "Jama tenant URL", "jama"),
     ("JAMA_CLIENT_ID", "Jama OAuth client id", "jama"),
     ("JAMA_CLIENT_SECRET", "Jama OAuth client secret", "jama"),
+]
+REQUIRED_VARS_AZURE_EMB = [
     ("EMBEDDING_BASE_URL", "Embedding endpoint URL", "embedding"),
     ("EMBEDDING_API_KEY", "Embedding API key", "embedding"),
 ]
@@ -219,6 +251,14 @@ OPTIONAL_VARS = [
 ]
 
 
+def _required_vars() -> list[tuple[str, str, str]]:
+    """Build the required-var list for the active embedding provider."""
+    rv = list(REQUIRED_VARS_JAMA)
+    if os.environ.get("EMBEDDING_PROVIDER", "local") == "azure":
+        rv.extend(REQUIRED_VARS_AZURE_EMB)
+    return rv
+
+
 def validate_config() -> list[dict]:
     """Return a list of issue dicts for missing/malformed config.
 
@@ -227,7 +267,7 @@ def validate_config() -> list[dict]:
     list means the configuration is complete.
     """
     issues: list[dict] = []
-    for name, label, feature in REQUIRED_VARS:
+    for name, label, feature in _required_vars():
         val = os.environ.get(name, "").strip()
         if not val or val.startswith("your-"):
             issues.append({
@@ -239,18 +279,21 @@ def validate_config() -> list[dict]:
             })
     # URL shape sanity (cheap, no network). Also flag placeholder hosts
     # (your-tenant / example.com) so a never-configured .env is detected.
-    for name, host in (("JAMA_URL", "your-tenant"),
-                       ("EMBEDDING_BASE_URL", "your-embedding-endpoint")):
+    url_checks = [("JAMA_URL", "your-tenant", "jama")]
+    if os.environ.get("EMBEDDING_PROVIDER", "local") == "azure":
+        url_checks.append(("EMBEDDING_BASE_URL", "your-embedding-endpoint",
+                           "embedding"))
+    for name, host, feature in url_checks:
         val = os.environ.get(name, "").strip()
         if val and not val.startswith(("http://", "https://")):
             issues.append({
-                "field": name, "severity": "error", "feature": "jama",
+                "field": name, "severity": "error", "feature": feature,
                 "message": f"{name} must start with http:// or https://",
             })
         if val and (host in val or "example.com" in val):
             issues.append({
                 "field": name, "severity": "error",
-                "feature": "embedding" if name == "EMBEDDING_BASE_URL" else "jama",
+                "feature": feature,
                 "message": f"{name} is still a placeholder ({val}). Set the "
                            f"real value via the setup wizard or configure_jama.",
             })

@@ -20,10 +20,13 @@ failing with SQLITE_BUSY.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
 from typing import Any, Iterable
+
+log = logging.getLogger(__name__)
 
 import sqlite_vec
 
@@ -173,10 +176,53 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
 """
 
 
+def _existing_vec_dim(conn: sqlite3.Connection) -> int | None:
+    """Return the embedding dimension of an existing chunks_vec index, or None.
+
+    Reads the column declaration of the ``embedding`` column from the vec0
+    table's schema. Returns None when the table doesn't exist yet (fresh DB).
+    """
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_vec'"
+        ).fetchone()
+        if not row or not row["sql"]:
+            return None
+        # The CREATE statement looks like: ... embedding FLOAT[1536] ...
+        import re
+        m = re.search(r"embedding\s+FLOAT\[(\d+)\]", row["sql"], re.IGNORECASE)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
 def init_db(db_path: str | None = None) -> sqlite3.Connection:
-    """Create all tables/extensions if missing and return a ready connection."""
+    """Create all tables/extensions if missing and return a ready connection.
+
+    If the ``chunks_vec`` index already exists but its embedding dimension
+    differs from the configured one (e.g. after switching EMBEDDING_PROVIDER
+    from azure/1536 to local/384), the vec index, FTS index and chunk rows are
+    dropped and rebuilt so the new dimension takes effect. Item metadata rows
+    are preserved (re-sync re-embeds them).
+    """
     conn = get_connection(db_path)
-    schema = SCHEMA.replace("{DIM}", str(settings.embedding.dimensions))
+    want_dim = settings.embedding.dimensions
+
+    # Detect a dimension mismatch on an existing vec index and rebuild.
+    existing_dim = _existing_vec_dim(conn)
+    if existing_dim is not None and existing_dim != want_dim:
+        log.warning("Embedding dimension changed %d -> %d; rebuilding vector "
+                    "index (chunks will be re-embedded on next sync).",
+                    existing_dim, want_dim)
+        with write_txn(conn):
+            conn.execute("DROP TABLE IF EXISTS chunks_vec")
+            conn.execute("DELETE FROM chunks_fts")
+            conn.execute("DELETE FROM chunks")
+        # Mark all projects as needing re-sync (not READY).
+        conn.execute("UPDATE projects SET status='NEW', chunk_count=0, "
+                     "last_sync_time=NULL, error=NULL WHERE status='READY'")
+
+    schema = SCHEMA.replace("{DIM}", str(want_dim))
     conn.executescript(schema)
     return conn
 
