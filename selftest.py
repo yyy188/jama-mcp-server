@@ -96,6 +96,62 @@ def test_list_item_types(jama) -> list:
     return types
 
 
+def test_find_project_by_name(jama, sample_name: str) -> None:
+    section("3b. find_projects (by name)")
+    if not sample_name:
+        _skip("find_projects", "no project name available to probe")
+        return
+    # Substring match: take a distinctive fragment of the sample name.
+    fragment = sample_name[: max(3, len(sample_name) // 2)].lower()
+    rows = jama.find_projects(fragment, limit=10)
+    if not rows:
+        _fail("find_projects (substring)", f"no match for fragment {fragment!r}")
+        return
+    _ok("find_projects (substring)",
+        f"{len(rows)} match(es) for {fragment!r}; "
+        f"sample id={rows[0].get('id')} name={rows[0].get('name')!r}")
+    # Exact match: the full sample name must match itself.
+    exact = jama.find_projects(sample_name, exact=True, limit=10)
+    if exact and any((r.get("name") or "").lower() == sample_name.lower()
+                     for r in exact):
+        _ok("find_projects (exact)",
+            f"exact match found: id={exact[0].get('id')}")
+    else:
+        _fail("find_projects (exact)",
+              f"expected exact match for {sample_name!r}, got {len(exact)} row(s)")
+    # Empty needle returns [] without error.
+    if jama.find_projects("") == []:
+        _ok("find_projects (empty guard)", "empty name returns []")
+    else:
+        _fail("find_projects (empty guard)", "expected [] for empty name")
+
+
+def test_find_item_type_by_name(jama) -> None:
+    section("3c. find_item_types (by name)")
+    # "test" is a very common Jama type fragment (Test Case, Test Plan, …).
+    rows = jama.find_item_types("test", limit=10)
+    if not rows:
+        _skip("find_item_types", "no type matching 'test' on this tenant")
+        return
+    _ok("find_item_types (substring)",
+        f"{len(rows)} match(es) for 'test'; sample: "
+        f"id={rows[0].get('id')} display={rows[0].get('display')!r}")
+    # Verify the richer payload fields are present.
+    r = rows[0]
+    if "display_plural" in r and "category" in r:
+        _ok("find_item_types payload",
+            f"has display_plural={r.get('display_plural')!r} "
+            f"category={r.get('category')!r}")
+    else:
+        _fail("find_item_types payload",
+              f"missing rich fields; keys={list(r.keys())}")
+    # Empty needle returns [] without error.
+    if jama.find_item_types("") == []:
+        _ok("find_item_types (empty guard)", "empty name returns []")
+    else:
+        _fail("find_item_types (empty guard)", "expected [] for empty name")
+
+
 def test_releases(jama, project_id: int) -> None:
     section("4. list_jama_releases")
     releases = jama.list_releases(project_id, limit=10)
@@ -196,9 +252,10 @@ def test_mcp_tools_registered() -> None:
         "init_jama_project", "get_sync_progress", "search_jama_semantics",
         "query_jama_native_metadata", "list_jama_projects", "get_jama_item",
         "get_jama_item_relationships", "get_jama_item_children",
-        "list_jama_project_relationships", "get_jama_item_comments",
-        "get_jama_item_attachments", "list_jama_releases",
-        "list_jama_test_runs", "list_jama_item_types",
+        "list_jama_project_relationships",
+        "get_jama_item_comments", "get_jama_item_attachments",
+        "list_jama_releases", "list_jama_test_runs", "list_jama_item_types",
+        "find_jama_project_by_name", "find_jama_item_type_by_name",
         "query_jama_endpoint", "validate_setup", "configure_jama",
     }
     try:
@@ -282,8 +339,11 @@ def main() -> int:
 
     proj, _all = test_jama_connect(jama)
     test_list_item_types(jama)
+    test_find_item_type_by_name(jama)
     if proj:
         pid = int(proj["id"])
+        pname = proj.get("name") or ""
+        test_find_project_by_name(jama, pname)
         test_releases(jama, pid)
         test_item_drilldown(jama, pid)
         test_project_relationships(jama, pid)

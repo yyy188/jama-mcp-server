@@ -751,6 +751,70 @@ def list_jama_item_types() -> dict:
 
 
 @mcp.tool()
+def find_jama_project_by_name(name: str, exact: bool = False,
+                              limit: int = 20) -> dict:
+    """Find Jama projects by name (case-insensitive) and return their info.
+
+    Useful when you only know a project's name (or a fragment of it) and need
+    its numeric id to feed into other tools (init_jama_project,
+    list_jama_releases, list_jama_test_runs, …). Matching is substring by
+    default; pass exact=True for full case-insensitive equality.
+
+    Args:
+        name: project name or fragment (e.g. "acre" matches "Acrelec").
+        exact: if True, require full case-insensitive name equality.
+        limit: max matches to return (default 20).
+
+    Returns:
+        {"count","results":[{id,project_key,name,status,description}, ...]}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    if not name or not str(name).strip():
+        return {"error": "name is required"}
+    try:
+        rows = jama().find_projects(str(name), exact=exact, limit=limit)
+    except Exception as exc:
+        log.error("find_jama_project_by_name failed: %s\n%s",
+                  exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"count": len(rows), "results": rows}
+
+
+@mcp.tool()
+def find_jama_item_type_by_name(name: str, exact: bool = False,
+                                limit: int = 20) -> dict:
+    """Find Jama item types by display name (case-insensitive) and return info.
+
+    Returns the type id (needed by search_jama_semantics / query_jama_native_metadata
+    item_type filters) plus category, display plural and description. Matching is
+    substring by default; pass exact=True for full case-insensitive equality.
+
+    Args:
+        name: type name or fragment (e.g. "test" matches "Test Case", "Test Plan").
+        exact: if True, require full case-insensitive name equality.
+        limit: max matches to return (default 20).
+
+    Returns:
+        {"count","results":[{id,display,display_plural,category,category_name,
+        description}, ...]}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    if not name or not str(name).strip():
+        return {"error": "name is required"}
+    try:
+        rows = jama().find_item_types(str(name), exact=exact, limit=limit)
+    except Exception as exc:
+        log.error("find_jama_item_type_by_name failed: %s\n%s",
+                  exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"count": len(rows), "results": rows}
+
+
+@mcp.tool()
 def query_jama_endpoint(path: str, params: str = None,
                         all_pages: bool = False) -> dict:
     """Power-user escape hatch: GET any Jama REST endpoint (read-only).

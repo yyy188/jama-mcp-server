@@ -614,6 +614,90 @@ class JamaClient:
         self.load_item_types()
         return [{"id": k, "name": v} for k, v in sorted(self._item_types.items())]
 
+    def find_projects(self, name: str, *, exact: bool = False,
+                      limit: int = 20) -> list[dict]:
+        """Find projects whose name matches ``name`` (case-insensitive).
+
+        Walks the project list and filters client-side because Jama's
+        ``/projects`` endpoint has no server-side name filter. With
+        ``exact=True`` only names that equal ``name`` are returned; otherwise
+        substring containment is used (so "acre" matches "Acrelec"). Each
+        result carries the project id so callers can feed it straight into
+        ``init_jama_project`` / ``list_jama_releases`` etc.
+
+        Args:
+            name: project name (or fragment) to match.
+            exact: require full case-insensitive equality instead of substring.
+            limit: max matches to return (default 20).
+
+        Returns:
+            list of {id, project_key, name, status, description} dicts.
+        """
+        needle = (name or "").strip().lower()
+        if not needle:
+            return []
+        out: list[dict] = []
+        for p in self._paginate("/projects", max_pages=50):
+            f = p.get("fields", {}) or {}
+            pname = (f.get("name") or "").strip()
+            hay = pname.lower()
+            match = (hay == needle) if exact else (needle in hay)
+            if not match:
+                continue
+            out.append({
+                "id": p.get("id"),
+                "project_key": p.get("projectKey"),
+                "name": pname,
+                "status": f.get("status"),
+                "description": clean_html(f.get("description", ""))[:300],
+            })
+            if len(out) >= limit:
+                break
+        return out
+
+    def find_item_types(self, name: str, *, exact: bool = False,
+                        limit: int = 20) -> list[dict]:
+        """Find item types whose display name matches ``name``.
+
+        Fetches the full ``/itemtypes`` payloads (richer than the cached
+        ``{id: display}`` map — includes category, category name, display
+        plural and description) and filters by display name. Matching is
+        case-insensitive; ``exact=True`` requires equality, otherwise
+        substring containment is used.
+
+        Args:
+            name: type name (or fragment) to match, e.g. "test", "Requirement".
+            exact: require full case-insensitive equality instead of substring.
+            limit: max matches to return (default 20).
+
+        Returns:
+            list of {id, display, display_plural, category, category_name,
+            description} dicts.
+        """
+        needle = (name or "").strip().lower()
+        if not needle:
+            return []
+        out: list[dict] = []
+        for it in self._paginate("/itemtypes", max_pages=10):
+            if not isinstance(it, dict):
+                continue
+            display = (it.get("display") or "").strip()
+            hay = display.lower()
+            match = (hay == needle) if exact else (needle in hay)
+            if not match:
+                continue
+            out.append({
+                "id": it.get("id"),
+                "display": display,
+                "display_plural": it.get("displayPlural"),
+                "category": it.get("category"),
+                "category_name": it.get("categoryName"),
+                "description": (it.get("description") or "").strip(),
+            })
+            if len(out) >= limit:
+                break
+        return out
+
     # ----- compact shapers for list responses --------------------------- #
     def _compact_item(self, raw: dict) -> dict:
         f = raw.get("fields", {}) or {}

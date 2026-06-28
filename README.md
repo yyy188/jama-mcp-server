@@ -147,6 +147,7 @@ wizard, or call the `configure_jama` / `validate_setup` tools at runtime.
 
 **Jama browse (read-only, gated by pre-flight)**
 - `list_jama_projects()` — all visible projects.
+- `find_jama_project_by_name(name, exact?)` — find projects by name → get id + info.
 - `get_jama_item(item_id)` — full single item (cleaned text).
 - `get_jama_item_children(item_id)` — decomposition children.
 - `get_jama_item_relationships(item_id)` / `list_jama_project_relationships(project_id, item_id?)` — relationships (cursor-paginated `/relationships`).
