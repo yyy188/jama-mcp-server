@@ -206,7 +206,8 @@ def _sync_project(project_id: int, *, job_id: str | None,
     total = client.count_project_items(project_id)
     if job_id:
         update_job(conn, job_id, total=total, done=0,
-                   message=f"Streaming fetch + index of {total or 'unknown'} items")
+                   message=f"Indexing {total or 'unknown'} top-level items "
+                           f"(Test Runs/Folders/Attachments excluded)")
 
     # Streaming fetch + batched index. We walk the item generator directly
     # (no list() materialization), chunk each item, and accumulate chunks

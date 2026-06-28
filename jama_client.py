@@ -303,6 +303,13 @@ class JamaClient:
         the streaming fetch+index, without waiting for the full pagination to
         complete. Reads ``meta.pageInfo.totalResults`` from a maxResults=1
         request; returns 0 if the probe fails (callers fall back to unknown).
+
+        NOTE: this queries ``/items``, which returns top-level content items
+        (Requirement, Test Case, Feature, …) — the ones worth semantic
+        indexing. It deliberately EXCLUDES Test Runs, Folders, Attachments and
+        Test Cycles, which ``/abstractitems`` would include but which carry no
+        retrievable text. So this count is intentionally smaller than the
+        ``/abstractitems`` total that ``query_jama_native_metadata`` sees.
         """
         try:
             data = self._get("/items", params={"project": project_id,
