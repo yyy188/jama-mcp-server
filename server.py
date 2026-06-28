@@ -528,7 +528,7 @@ def get_sync_progress(job_id: str) -> dict:
 def search_jama_semantics(project_id: str, query: str,
                           sub_queries: list[str] = None,
                           item_type: str = None, top_k: int = 5,
-                          candidate_k: int = 50,
+                          candidate_k: int = 25,
                           modified_after: str = None,
                           modified_before: str = None) -> dict:
     """Semantic search over an initialized Jama project using high-precision RAG.
@@ -561,7 +561,10 @@ def search_jama_semantics(project_id: str, query: str,
         item_type: optional Jama item-type id to filter (e.g. "89011" for Test
                    Cases, "89009" for Requirements). Pass None for all.
         top_k: final results to return (default 5).
-        candidate_k: candidate pool size before reranking (default 50).
+        candidate_k: candidate pool size before reranking (default 25). The
+                     reranker scores every candidate, so latency scales
+                     roughly linearly with this value (~340ms/candidate on
+                     CPU). 25 keeps a single search under ~10s.
         modified_after: optional ISO-8601 lower bound on item modified date
                         (inclusive). Naive timestamps are assumed UTC.
                         e.g. "2024-01-01" or "2024-06-01T00:00:00Z".

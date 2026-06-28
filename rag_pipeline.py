@@ -777,7 +777,7 @@ class RAGPipeline:
     def search(self, project_id: int, query: str, *,
                sub_queries: list[str] | None = None,
                item_type: int | None = None,
-               top_k: int = 5, candidate_k: int = 50,
+               top_k: int = 5, candidate_k: int = 25,
                modified_after: str | None = None,
                modified_before: str | None = None) -> list[dict]:
         """Full RAG chain -> list of result dicts (best first).
