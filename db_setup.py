@@ -260,18 +260,21 @@ def replace_chunks(conn: sqlite3.Connection, item_id: int,
                              ch.get("modified_date"), ch["text"]))
             vec_rows.append((ch["chunk_id"], _vec_blob(emb)))
         if rows:
+            # INSERT OR REPLACE so a re-sync (or a chunk_id collision from a
+            # partially-cleaned prior state) upserts instead of raising
+            # UNIQUE — replace_chunks is meant to be idempotent per item.
             conn.executemany(
-                """INSERT INTO chunks (chunk_id, item_id, project_id, item_type,
+                """INSERT OR REPLACE INTO chunks (chunk_id, item_id, project_id, item_type,
                    item_type_name, document_key, name, status, section,
                    chunk_index, text, modified_date, updated_at)
                    VALUES (:chunk_id,:item_id,:project_id,:item_type,:item_type_name,
                    :document_key,:name,:status,:section,:chunk_index,:text,
                    :modified_date, datetime('now'))""", rows)
             conn.executemany(
-                "INSERT INTO chunks_fts (chunk_id, project_id, item_type, "
+                "INSERT OR REPLACE INTO chunks_fts (chunk_id, project_id, item_type, "
                 "modified_date, text) VALUES (?,?,?,?,?)", fts_rows)
             conn.executemany(
-                "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
                 vec_rows)
 
 

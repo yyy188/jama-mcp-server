@@ -199,32 +199,35 @@ def _sync_project(project_id: int, *, job_id: str | None,
         upsert_project(conn, project_id, status="ERROR", error=msg)
         return
 
-    # Probe the total item count cheaply (one maxResults=1 page) so the job's
-    # `total` is known up-front and progress is visible from the very first
-    # item, instead of only after the full pagination finishes. Falls back to
-    # 0 (unknown) if the probe fails — progress then reports done count only.
-    total = client.count_project_items(project_id)
-    if job_id:
-        update_job(conn, job_id, total=total, done=0,
-                   message=f"Indexing {total or 'unknown'} top-level items "
-                           f"(Test Runs/Folders/Attachments excluded)")
-
-    # Streaming fetch + batched index. We walk the item generator directly
-    # (no list() materialization), chunk each item, and accumulate chunks
-    # across items into embedding-sized batches. This does two things at once:
-    #   1. progress updates fire per-item as items stream in (issue #1);
-    #   2. embedding HTTP requests are packed to batch_size across items
-    #      instead of one underfilled request per item (issue #2).
+    # Concurrent streaming fetch + batched index.
+    #
+    # Page 1 of the fetch reports the server-side total via on_total, so we
+    # don't need a separate probe request. Pages are then fetched in waves of
+    # `download_concurrency` parallel requests (borrowed from a prior impl:
+    # Jama caps pages at 50 and has no bulk-get, so serial pagination is the
+    # download bottleneck on large projects). As each wave arrives we chunk
+    # the items and accumulate chunks across items into embedding-sized pools;
+    # when a pool fills we flush (embed with concurrent batch requests + store).
     pipeline = rag()
     max_items = settings.sync.max_items_per_run if incremental else None
+    dl_concurrency = settings.sync.download_concurrency
     batch_size = settings.embedding.batch_size
+    total_holder: list[int] = [0]  # set by on_total callback
+
+    def _on_total(n: int) -> None:
+        total_holder[0] = n
+        if job_id:
+            update_job(conn, job_id, total=n, done=0,
+                       message=f"Indexing {n} top-level items "
+                               f"(Test Runs/Folders/Attachments excluded)")
+
     pending: list[tuple[dict, list[dict]]] = []  # (item, chunks) awaiting embed
     pending_chunk_count = 0
     done = 0
     chunk_total = 0
 
     def _flush_pending() -> None:
-        """Embed + store all accumulated chunks in packed batches."""
+        """Embed + store all accumulated chunks in packed (concurrent) batches."""
         nonlocal chunk_total
         if not pending:
             return
@@ -233,7 +236,8 @@ def _sync_project(project_id: int, *, job_id: str | None,
         for item, chunks in pending:
             owners.append((item, chunks))
             flat.extend(chunks)
-        # embed_many packs flat into batch_size HTTP requests across items.
+        # embed_many packs flat into batch_size HTTP requests across items,
+        # fired concurrently (EMBEDDING_CONCURRENCY).
         embeddings = pipeline.embed_many(flat)
         # Write each item's metadata + its chunks in one go.
         idx = 0
@@ -252,8 +256,11 @@ def _sync_project(project_id: int, *, job_id: str | None,
         pending.clear()
         pending_chunk_count = 0
 
+    total = total_holder[0]
     for item in client.iter_project_items(
-            project_id, modified_after=last_sync, max_items=max_items):
+            project_id, modified_after=last_sync, max_items=max_items,
+            concurrency=dl_concurrency, on_total=_on_total):
+        total = total_holder[0] or total
         try:
             chunks = chunk_item(item)
             if chunks:
@@ -268,7 +275,9 @@ def _sync_project(project_id: int, *, job_id: str | None,
             log.warning("Failed to chunk item %s: %s", item.get("item_id"), exc)
         done += 1
         # Flush when the pending chunk pool reaches an embedding batch. This
-        # keeps memory bounded and packs each HTTP request to capacity.
+        # keeps memory bounded and packs each HTTP request to capacity. Each
+        # flush commits to SQLite, so a crash mid-sync loses at most the
+        # in-flight pool (< batch_size chunks), never the whole project.
         if pending_chunk_count >= batch_size:
             _flush_pending()
         if job_id:
@@ -278,6 +287,7 @@ def _sync_project(project_id: int, *, job_id: str | None,
 
     # Flush any trailing partial batch.
     _flush_pending()
+    total = total_holder[0] or total
 
     if done == 0:
         if job_id:
@@ -1025,9 +1035,37 @@ def _start_scheduler() -> BackgroundScheduler | None:
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+def _resume_interrupted_syncs() -> None:
+    """Crash recovery: re-queue any project left in INITIALIZING.
+
+    A sync that was interrupted by a crash/process kill leaves the project in
+    INITIALIZING with a stale (or absent) last_sync_time. Already-flushed items
+    are safely persisted (each flush commits), but the project was never marked
+    READY, so it must be re-synced to guarantee completeness. Because upsert is
+    idempotent, re-processing already-indexed items is harmless — they're just
+    overwritten. We kick off a background incremental=False re-sync for each
+    stuck project so the server comes back up consistent without manual action.
+    """
+    conn = db()
+    stuck = conn.execute(
+        "SELECT project_id FROM projects WHERE status = 'INITIALIZING'"
+    ).fetchall()
+    if not stuck:
+        return
+    for row in stuck:
+        pid = row["project_id"]
+        job_id = f"resume-{uuid.uuid4().hex[:12]}"
+        log.warning("Recovery: project %s was left INITIALIZING (crash during "
+                    "sync); re-queuing full sync as job %s", pid, job_id)
+        create_job(conn, job_id, pid, "init")
+        _executor.submit(_run_job, pid, job_id, incremental=False)
+
+
 def main() -> None:
     # Eagerly initialize the DB so schema/extension errors surface at startup.
     init_db()
+    # Recover any project interrupted mid-sync by a prior crash before serving.
+    _resume_interrupted_syncs()
     _start_scheduler()
     log.info("Jama MCP Server starting (stdio)...")
     mcp.run(transport="stdio")

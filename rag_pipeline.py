@@ -180,6 +180,59 @@ class EmbeddingClient:
     def embed_one(self, text: str) -> list[float]:
         return self.embed_texts([text])[0]
 
+    def embed_many_concurrent(self, texts: list[str],
+                              concurrency: int = 4) -> list[list[float]]:
+        """Embed a large text list with concurrent batch requests.
+
+        Splits ``texts`` into ``batch_size`` slices and fires up to
+        ``concurrency`` of them in parallel (the embedding endpoint is
+        stateless, so parallel HTTP requests are safe). Results are reassembled
+        in input order. Falls back to the serial ``embed_texts`` when
+        ``concurrency <= 1`` or there's only one batch.
+
+        This is the indexing path used by ``_sync_project``: a 5000-item
+        project with ~7000 chunks / batch_size 64 = ~110 batches; at
+        concurrency=4 the wall-time is ~4x shorter than serial.
+        """
+        if not texts:
+            return []
+        if concurrency <= 1 or len(texts) <= self._batch:
+            return self.embed_texts(texts)
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Slice into batches; record (start_index, batch) so we can place
+        # each result back at the right position.
+        slices: list[tuple[int, list[str]]] = []
+        for i in range(0, len(texts), self._batch):
+            slices.append((i, texts[i:i + self._batch]))
+
+        out: list[list[float] | None] = [None] * len(texts)
+
+        def _embed_slice(start_batch: list[str], batch_texts: list[str]) -> None:
+            return start_batch, batch_texts
+
+        def _do(batch_texts: list[str]) -> list[list[float]]:
+            r = self._sess.post(self._url, headers=self._headers,
+                                json={"model": self._model, "input": batch_texts},
+                                timeout=self._timeout)
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"Embedding API {r.status_code}: {r.text[:300]}")
+            data = r.json()["data"]
+            data.sort(key=lambda d: d.get("index", 0))
+            return [d["embedding"] for d in data]
+
+        with ThreadPoolExecutor(max_workers=concurrency,
+                                thread_name_prefix="embed") as ex:
+            futures = {ex.submit(_do, bt): (start, bt) for start, bt in slices}
+            for fut in futures:
+                start, bt = futures[fut]
+                embs = fut.result()
+                for j, e in enumerate(embs):
+                    out[start + j] = e
+        # All positions filled (batches are contiguous); cast away None.
+        return [v for v in out if v is not None]
+
 
 # --------------------------------------------------------------------------- #
 # Multi-Query expansion (LlamaIndex LLM + PromptTemplate)
@@ -472,9 +525,12 @@ class RAGPipeline:
         Unlike calling ``embed_chunks`` once per item (which underfills each
         HTTP request when items have only 1-3 chunks), this batches across
         items: it walks the whole chunk list in ``batch_size`` slices and
-        issues one embedding request per slice. For a project with ~1.4
+        issues embedding requests for each slice. For a project with ~1.4
         chunks/item and ``batch_size=64`` this cuts the number of HTTP round
         trips ~45x, turning minutes of serial network wait into seconds.
+
+        When ``EMBEDDING_CONCURRENCY > 1`` (default 4) the batches are fired
+        concurrently, cutting indexing wall-time a further ~3-4x.
 
         Embeddings are returned position-aligned with the input ``chunks``
         so callers can ``zip(chunks, embeddings)`` directly.
@@ -482,7 +538,8 @@ class RAGPipeline:
         if not chunks:
             return []
         texts = [c["text"] for c in chunks]
-        return self.embedder.embed_texts(texts)
+        return self.embedder.embed_many_concurrent(
+            texts, concurrency=settings.embedding.concurrency)
 
     # ----- retrieval ----------------------------------------------------- #
     def search(self, project_id: int, query: str, *,

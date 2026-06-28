@@ -265,6 +265,57 @@ class JamaClient:
             if settings.jama.page_delay:
                 time.sleep(settings.jama.page_delay)
 
+    def iter_pages_concurrent(self, path: str, params: dict | None = None,
+                              *, concurrency: int = 16,
+                              on_total=None) -> Iterator[list[dict]]:
+        """Concurrent wave-by-wave pager (borrowed from a prior impl).
+
+        Fetches page 1 first to learn ``totalResults`` (and calls
+        ``on_total(total)`` so callers can report real progress), then fetches
+        the remaining pages in WAVES of ``concurrency`` concurrent requests.
+        Yields one list of items per wave so peak memory stays ~
+        ``concurrency * page_size`` items regardless of project size.
+
+        Each page uses ``_get_page_with_stall_retry`` so a mid-wave network
+        stall on one page is retried rather than aborting the whole wave.
+        Order within a wave is preserved by ``ThreadPoolExecutor.map``.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        base = dict(params or {})
+        page_size = settings.jama.page_size
+
+        # Page 1: learn the total.
+        first = self._get_page_with_stall_retry(
+            path, {**base, "startAt": 0, "maxResults": page_size})
+        page_info = first.get("meta", {}).get("pageInfo", {})
+        total = int(page_info.get("totalResults", 0) or 0)
+        if on_total is not None:
+            try:
+                on_total(total)
+            except Exception:
+                pass  # progress reporting must never break the sync
+        page1 = list(first.get("data") or [])
+        yield page1
+        if total <= page_size:
+            return
+
+        # Remaining pages: fetch startAt values in concurrent waves.
+        starts = list(range(page_size, total, page_size))
+
+        def _fetch(start_at: int) -> list[dict]:
+            return self._get_page_with_stall_retry(
+                path, {**base, "startAt": start_at, "maxResults": page_size}
+            ).get("data") or []
+
+        with ThreadPoolExecutor(max_workers=concurrency,
+                                thread_name_prefix="jama-page") as ex:
+            for i in range(0, len(starts), concurrency):
+                wave: list[dict] = []
+                for rows in ex.map(_fetch, starts[i:i + concurrency]):
+                    wave.extend(rows)
+                yield wave
+                wave = None  # free before next wave
+
     # ----- item types ---------------------------------------------------- #
     def load_item_types(self) -> dict[int, str]:
         """Cache and return {itemType id -> display name}."""
@@ -322,25 +373,49 @@ class JamaClient:
 
     def iter_project_items(self, project_id: int,
                            modified_after: str | None = None,
-                           max_items: int | None = None) -> Iterator[dict]:
+                           max_items: int | None = None,
+                           *, concurrency: int = 1,
+                           on_total=None) -> Iterator[dict]:
         """Yield normalized item dicts for a project.
 
         ``modified_after`` (ISO-8601) enables incremental sync: only items
         whose ``modifiedDate`` is strictly greater are yielded. Filtering is
         done client-side because Jama's REST API has no server-side
         modified-date filter.
+
+        ``concurrency > 1`` switches to the concurrent wave-by-wave pager
+        (``iter_pages_concurrent``): page 1 is fetched first (calling
+        ``on_total(total)`` so progress is reportable immediately), then
+        remaining pages are fetched in waves of ``concurrency`` parallel
+        requests. With ``concurrency=1`` (default) the serial pager is used.
         """
         self.load_item_types()
         count = 0
-        for raw in self._paginate("/items", {"project": project_id}):
-            norm = self._normalize_item(raw)
-            if modified_after and norm["modified_date"] and \
-                    norm["modified_date"] <= modified_after:
-                continue
-            yield norm
-            count += 1
-            if max_items and count >= max_items:
-                break
+
+        def _emit_wave(raws: list[dict]) -> Iterator[dict]:
+            nonlocal count
+            for raw in raws:
+                norm = self._normalize_item(raw)
+                if modified_after and norm["modified_date"] and \
+                        norm["modified_date"] <= modified_after:
+                    continue
+                yield norm
+                count += 1
+                if max_items and count >= max_items:
+                    return
+
+        if concurrency > 1:
+            for wave in self.iter_pages_concurrent(
+                    "/items", {"project": project_id},
+                    concurrency=concurrency, on_total=on_total):
+                yield from _emit_wave(wave)
+                if max_items and count >= max_items:
+                    return
+        else:
+            for raw in self._paginate("/items", {"project": project_id}):
+                yield from _emit_wave([raw])
+                if max_items and count >= max_items:
+                    return
 
     def _normalize_item(self, raw: dict) -> dict:
         """Flatten a Jama item payload into our storage shape + cleaned text."""

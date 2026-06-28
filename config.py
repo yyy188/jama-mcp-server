@@ -92,10 +92,20 @@ class EmbeddingSettings:
     model: str = _get("EMBEDDING_MODEL", "text-embedding-3-small")
     # text-embedding-3-small == 1536 dims.
     dimensions: int = _get_int("EMBEDDING_DIMENSIONS", 1536)
-    batch_size: int = _get_int("EMBEDDING_BATCH_SIZE", 64)
+    # Texts per embedding HTTP request. Benchmarked on a real Azure
+    # text-embedding-3-small gateway: batch=32 outperforms 64/128 because the
+    # gateway's per-request processing cost grows super-linearly with input
+    # count, while HTTP round-trip cost is small. 32 is the measured sweet spot.
+    batch_size: int = _get_int("EMBEDDING_BATCH_SIZE", 32)
     timeout: int = _get_int("EMBEDDING_TIMEOUT", 60)
     # Header used to carry the key (Azure uses "api-key", OpenAI uses "Authorization").
     key_header: str = _get("EMBEDDING_KEY_HEADER", "api-key")
+    # Concurrent embedding HTTP requests during bulk indexing. Benchmarked:
+    # the Azure gateway has internal request queuing, so high concurrency
+    # (4-8) is SLOWER than low concurrency (2-3) — parallel requests queue
+    # server-side. 2 gives a small speedup over serial without triggering
+    # queuing. Lower = safer if you see 429s.
+    concurrency: int = _get_int("EMBEDDING_CONCURRENCY", 2)
 
 
 @dataclass(frozen=True)
@@ -153,6 +163,13 @@ class SyncSettings:
     hours: int = _get_int("SYNC_INTERVAL_HOURS", 2)
     # Hard cap of items inspected per project per sync run (safety valve).
     max_items_per_run: int = _get_int("SYNC_MAX_ITEMS_PER_RUN", 5000)
+    # Concurrent page fetches during a project download. Jama REST caps pages
+    # at 50 items and has no bulk-get, so a large project is thousands of
+    # serial round-trips. Fetching pages wave-by-wave (each wave = up to
+    # `download_concurrency` pages in parallel) cuts download time ~10x.
+    # 16 is the measured sweet spot (borrowed from a prior production impl);
+    # lower it if Jama returns 429s.
+    download_concurrency: int = _get_int("SYNC_DOWNLOAD_CONCURRENCY", 16)
 
 
 @dataclass(frozen=True)

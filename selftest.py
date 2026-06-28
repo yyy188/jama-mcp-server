@@ -239,6 +239,90 @@ def test_error_path_requires_arg(jama) -> None:
         _fail("list_test_runs no-arg", f"wrong exception type: {type(exc).__name__}")
 
 
+def test_concurrent_sync(jama, project_id: int) -> None:
+    section("8b. Concurrent download + batched embed")
+    import time
+    import server
+    from db_setup import (init_db, get_job, upsert_project, create_job,
+                          count_chunks, write_txn)
+    # Only run on small projects so the self-test stays fast.
+    total = jama.count_project_items(project_id)
+    if total > 100:
+        _skip("concurrent sync", f"project {project_id} has {total} items; "
+              f"needs a small (<100) project to stay fast")
+        return
+    conn = init_db()
+    upsert_project(conn, project_id, status="NEW")
+    with write_txn(conn):
+        conn.execute("DELETE FROM chunks WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM chunks_fts WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM chunks_vec")
+        conn.execute("DELETE FROM items WHERE project_id=?", (project_id,))
+    import uuid as _uuid
+    job_id = f"selftest-sync-{_uuid.uuid4().hex[:8]}"
+    create_job(conn, job_id, project_id, "init")
+    t0 = time.time()
+    try:
+        server._sync_project(project_id, job_id=job_id, incremental=False)
+    except Exception as exc:
+        _fail("concurrent sync", f"raised: {exc}")
+        conn.close()
+        return
+    elapsed = time.time() - t0
+    job = get_job(conn, job_id)
+    chunks = count_chunks(conn, project_id)
+    if job["status"] == "DONE" and chunks > 0:
+        _ok("concurrent sync",
+            f"DONE in {elapsed:.1f}s, {job['done']}/{job['total']} items, "
+            f"{chunks} chunks")
+    else:
+        _fail("concurrent sync",
+              f"status={job['status']} chunks={chunks} done={job['done']}")
+    conn.close()
+
+
+def test_crash_recovery(project_id: int) -> None:
+    section("8c. Crash recovery: INITIALIZING project auto-resynced")
+    import time
+    import server
+    from jama_client import JamaClient
+    from db_setup import (init_db, get_project, upsert_project, count_chunks,
+                          write_txn)
+    # Only run on small projects so the self-test stays fast.
+    total = JamaClient().count_project_items(project_id)
+    if total > 100:
+        _skip("crash recovery", f"project {project_id} has {total} items; "
+              f"needs a small (<100) project to stay fast")
+        return
+    conn = init_db()
+    # Simulate a crash: leave the project INITIALIZING with no chunks.
+    upsert_project(conn, project_id, status="INITIALIZING")
+    with write_txn(conn):
+        conn.execute("DELETE FROM chunks WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM chunks_fts WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM chunks_vec")
+        conn.execute("DELETE FROM items WHERE project_id=?", (project_id,))
+    before = get_project(conn, project_id)
+    # Run the startup recovery function.
+    server._resume_interrupted_syncs()
+    # Poll for completion (the recovery submits a background job).
+    for _ in range(40):
+        time.sleep(3)
+        p = get_project(conn, project_id)
+        if p["status"] in ("READY", "ERROR"):
+            break
+    after = get_project(conn, project_id)
+    if before["status"] == "INITIALIZING" and after["status"] == "READY" \
+            and count_chunks(conn, project_id) > 0:
+        _ok("crash recovery",
+            f"INITIALIZING(0 chunks) -> READY({count_chunks(conn, project_id)} chunks)")
+    else:
+        _fail("crash recovery",
+              f"before={before['status']} after={after['status']} "
+              f"chunks={count_chunks(conn, project_id)}")
+    conn.close()
+
+
 def test_mcp_tools_registered() -> None:
     section("9. MCP tools registered")
     # Import server (registers @mcp.tool() decorators) without running it.
@@ -351,6 +435,23 @@ def main() -> int:
         test_get_raw(jama, pid)
     else:
         _skip("project-scoped tests", "no project available")
+
+    # Concurrent sync + crash recovery need a SMALL project to stay fast.
+    # Find one (<=50 items) by probing the project list.
+    small_pid = None
+    for p in (proj, *_all) if proj else _all:
+        try:
+            if jama.count_project_items(int(p["id"])) <= 50:
+                small_pid = int(p["id"])
+                break
+        except Exception:
+            continue
+    if small_pid:
+        test_concurrent_sync(jama, small_pid)
+        test_crash_recovery(small_pid)
+    else:
+        _skip("concurrent sync + crash recovery",
+              "no small (<=50 items) project found")
 
     test_error_path_requires_arg(jama)
     test_mcp_tools_registered()
