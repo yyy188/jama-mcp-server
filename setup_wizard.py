@@ -84,13 +84,6 @@ def _collect() -> dict:
                                        os.environ.get("EMBEDDING_API_KEY", ""),
                                        secret=True)
 
-    print("\n--- Optional chat LLM (Multi-Query expansion; leave blank = fallback) ---")
-    values["LLM_BASE_URL"] = _ask("Chat LLM endpoint (blank to skip)",
-                                  os.environ.get("LLM_BASE_URL", ""))
-    if values["LLM_BASE_URL"]:
-        values["LLM_API_KEY"] = _ask("Chat LLM API key",
-                                     os.environ.get("LLM_API_KEY", ""), secret=True)
-
     print("\n--- Storage / sync (defaults are fine for most setups) ---")
     values["JAMA_MCP_DB_PATH"] = _ask("SQLite DB path",
                                       os.environ.get(

@@ -1,8 +1,10 @@
 """RAG pipeline: chunking, embeddings, Multi-Query, hybrid recall, RRF, rerank.
 
 Retrieval chain (``search`` method):
-1. Multi-Query   - expand the user query into N sub-queries (LLM if available,
-                   otherwise deterministic lexical variants).
+1. Multi-Query   - sub-queries supplied by the caller (the MCP LLM client is
+                   expected to expand the user query into 3-5 variants); when
+                   none are supplied, deterministic lexical variants are used
+                   so RRF fusion still benefits from multiple query angles.
 2. Hybrid recall - for each sub-query: vector recall (sqlite-vec) + keyword
                    recall (FTS5), each limited to ``candidate_k``.
 3. RRF fusion    - Reciprocal Rank Fusion merges all candidate lists into one
@@ -13,7 +15,6 @@ Retrieval chain (``search`` method):
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -29,21 +30,11 @@ from db_setup import (fts_search, get_connection, vector_search,
 log = logging.getLogger(__name__)
 
 # LlamaIndex is the primary RAG framework: it provides the recursive splitter
-# (SentenceSplitter), the Document/TextNode document model, the prompt template
-# engine and the LLM abstraction used for Multi-Query expansion.
+# (SentenceSplitter) and the Document/TextNode document model used for
+# chunking. Multi-Query expansion is performed by the MCP LLM client and
+# passed in via ``search(sub_queries=...)``; no server-side chat LLM is used.
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.prompts import PromptTemplate
 from llama_index.core.schema import Document, TextNode
-
-# Multi-Query prompt (LlamaIndex PromptTemplate). Produces N diverse
-# sub-queries for RRF fusion to maximize recall.
-MULTI_QUERY_PROMPT = PromptTemplate(
-    "You are an expert search query rewriter for a requirements management "
-    "system (Jama). Rewrite the user's query into {n} diverse search "
-    "sub-queries that capture different semantic angles, to maximize recall. "
-    "Return ONLY a JSON array of strings, no commentary.\n\n"
-    "Original query: {query}"
-)
 
 
 # --------------------------------------------------------------------------- #
@@ -449,66 +440,60 @@ class LocalEmbeddingClient:
 
 
 # --------------------------------------------------------------------------- #
-# Multi-Query expansion (LlamaIndex LLM + PromptTemplate)
+# Multi-Query expansion
 # --------------------------------------------------------------------------- #
-class MultiQueryExpander:
-    """Expand a query into N sub-queries using LlamaIndex.
+def _normalize_sub_queries(subs: list[str], query: str,
+                           max_n: int = 5) -> list[str]:
+    """Normalize caller-supplied sub-queries for RRF fusion.
 
-    When ``LLM_BASE_URL`` is configured, a LlamaIndex ``OpenAI`` LLM drives the
-    expansion via the ``MULTI_QUERY_PROMPT`` PromptTemplate (the LlamaIndex
-    native path). Otherwise it falls back to deterministic lexical variants so
-    RRF fusion still benefits from multiple query angles without an LLM.
+    The original ``query`` is always forced to the front (rerank scores
+    ``(query, chunk)`` pairs against it, so it must be one of the recall
+    angles). Empty/non-string entries are dropped and the list is
+    de-duplicated case-insensitively (preserving first-seen order) and capped
+    at ``max_n`` — each sub-query triggers its own vector + FTS5 recall pass,
+    so an unbounded list would multiply recall cost. Falls back to ``[query]``
+    when nothing usable remains.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    # Original query first, so rerank always has its native phrasing.
+    for s in [query, *subs]:
+        if not isinstance(s, str):
+            continue
+        s = s.strip()
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    if not out:
+        out = [query] if query else []
+    return out[: max(max_n, 1)]
+
+
+class MultiQueryExpander:
+    """Deterministic lexical Multi-Query fallback.
+
+    Query expansion is normally done by the MCP LLM client and passed to
+    :meth:`RAGPipeline.search` via ``sub_queries``. This expander is the
+    zero-configuration fallback used when no sub-queries are supplied: it
+    derives deterministic lexical variants (stopword-stripped + truncated) so
+    RRF fusion still benefits from multiple recall angles. It makes no network
+    calls and needs no configuration.
     """
 
     def __init__(self, n: int = 3) -> None:
-        self.n = n
-        self._cfg = settings.llm
-        self._llm = None
-        if self._cfg.base_url and self._cfg.api_key:
-            try:
-                from llama_index.llms.openai import OpenAI
-                # Point LlamaIndex's OpenAI LLM at the configured gateway.
-                # api_key/auth header differ between Azure (api-key) and
-                # OpenAI (Bearer); the OpenAI client uses Bearer by default.
-                self._llm = OpenAI(
-                    model=self._cfg.model,
-                    api_key=self._cfg.api_key,
-                    api_base=f"{self._cfg.base_url.rstrip('/')}/openai/v1",
-                    temperature=0.2,
-                    max_tokens=256,
-                    timeout=self._cfg.timeout,
-                )
-            except Exception as exc:
-                log.warning("Could not init LlamaIndex LLM (%s); "
-                            "using fallback multi-query", exc)
-                self._llm = None
+        self.n = max(n, 1)
 
     def expand(self, query: str) -> list[str]:
         query = (query or "").strip()
         if not query:
             return []
-        if self._llm is not None:
-            try:
-                return self._llm_expand(query)
-            except Exception as exc:
-                log.warning("Multi-query LLM failed (%s); using fallback", exc)
-        return self._fallback_expand(query)
+        return self._lexical_expand(query)
 
-    def _llm_expand(self, query: str) -> list[str]:
-        # LlamaIndex native path: format the PromptTemplate and call the LLM.
-        prompt_str = MULTI_QUERY_PROMPT.format(n=self.n, query=query)
-        resp = self._llm.complete(prompt_str)
-        content = str(resp).strip()
-        # Tolerate code-fenced JSON.
-        content = re.sub(r"^```(?:json)?|```$", "", content,
-                         flags=re.MULTILINE).strip()
-        subs = json.loads(content)
-        subs = [s for s in subs if isinstance(s, str) and s.strip()]
-        if not subs:
-            return [query]
-        return [query] + subs[: self.n - 1]
-
-    def _fallback_expand(self, query: str) -> list[str]:
+    def _lexical_expand(self, query: str) -> list[str]:
         """Deterministic variants: original + keyword-focused + broadened."""
         subs = [query]
         # Keep only alphanumeric tokens (drop common stopwords).
@@ -599,9 +584,14 @@ class QwenReranker:
             src = load_from or self._cfg.model_name
             self._tokenizer = AutoTokenizer.from_pretrained(
                 src, trust_remote_code=True)
+            # Load in bf16 (half the memory of fp32; modern CPUs support it via
+            # AVX512_BF16/AMX) with low_cpu_mem_usage to avoid a transient 2x
+            # peak while the weights are materialized. fp32 was ~2.4 GB; bf16
+            # is ~1.2 GB, leaving headroom for the forward-pass activations.
             self._model = AutoModelForCausalLM.from_pretrained(
                 src, trust_remote_code=True,
-                torch_dtype=torch.float32).to(self._cfg.device).eval()
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True).to(self._cfg.device).eval()
             log.info("Qwen3-Reranker loaded.")
             return True
         except Exception as exc:
@@ -638,19 +628,34 @@ class QwenReranker:
         endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
         url = (f"{endpoint.rstrip('/')}/{cfg.model_name}/resolve/main/"
                f"model.safetensors")
+        # Fast path: weights already downloaded into the project-local cache.
+        # We MUST check this BEFORE the network speed test, otherwise a
+        # transient network blip makes speed_test fail and degrades to RRF even
+        # though the model is fully present on disk. Re-verifying the small
+        # tokenizer/config files too lets us return a fully-offline load path.
+        from config import USER_DIR
+        cache_dir = os.environ.get("HF_HOME", str(USER_DIR / "huggingface"))
+        dest_dir = os.path.join(cache_dir, "hub",
+                                "models--" + cfg.model_name.replace("/", "--"),
+                                "snapshots", "manual")
+        dest = os.path.join(dest_dir, "model.safetensors")
+        small_files = ("config.json", "tokenizer.json",
+                       "tokenizer_config.json", "vocab.json", "merges.txt",
+                       "chat_template.jinja")
+        if (os.path.exists(dest) and os.path.getsize(dest) > 0
+                and all(os.path.exists(os.path.join(dest_dir, f))
+                        and os.path.getsize(os.path.join(dest_dir, f)) > 0
+                        for f in small_files)):
+            log.info("Qwen3-Reranker weights cached locally at %s; "
+                     "skipping network check.", dest_dir)
+            return dest_dir
         # Pre-flight speed test against the mirror (1 MB probe). Aborts with a
         # clear network error if the mirror is too slow.
         speed_test(url, min_bytes_per_sec=cfg.hf_min_bytes_per_sec,
                    timeout=cfg.hf_speed_test_timeout, label="hf-mirror")
         # Download weights (resumable, stall-retried) into a local snapshot dir
         # under the project-local HF cache (user/huggingface/hub/...).
-        from config import USER_DIR
-        cache_dir = os.environ.get("HF_HOME", str(USER_DIR / "huggingface"))
-        dest_dir = os.path.join(cache_dir, "hub",
-                                "models--" + cfg.model_name.replace("/", "--"),
-                                "snapshots", "manual")
         os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, "model.safetensors")
         download_with_retry(url, dest,
                             min_bytes_per_sec=cfg.hf_min_bytes_per_sec,
                             max_retries=cfg.hf_download_retries,
@@ -714,7 +719,14 @@ class QwenReranker:
                 tok = self._tokenizer(prompts, padding=True, truncation=True,
                                       max_length=self._cfg.max_length,
                                       return_tensors="pt").to(self._cfg.device)
-                logits = self._model(**tok).logits[:, -1, :]
+                # logits_to_keep=1: only compute logits for the LAST token
+                # position. Without this, the model materializes a full
+                # [batch, seq_len, vocab(~152k)] tensor (~5 GB at batch=16,
+                # seq=512, fp32) — the root cause of the prior OOM. We only
+                # need P("yes") at the final position, so 1 is sufficient and
+                # cuts that tensor by ~seq_len× (hundreds-fold).
+                out = self._model(**tok, logits_to_keep=1)
+                logits = out.logits[:, -1, :]
                 yes = torch.softmax(logits, dim=-1)[:, yes_id]
                 scores.extend(yes.tolist())
         return scores
@@ -763,20 +775,32 @@ class RAGPipeline:
 
     # ----- retrieval ----------------------------------------------------- #
     def search(self, project_id: int, query: str, *,
+               sub_queries: list[str] | None = None,
                item_type: int | None = None,
                top_k: int = 5, candidate_k: int = 50,
                modified_after: str | None = None,
                modified_before: str | None = None) -> list[dict]:
         """Full RAG chain -> list of result dicts (best first).
 
+        ``sub_queries`` (optional) are caller-supplied query expansions — the
+        MCP LLM client is expected to rewrite ``query`` into 3-5 diverse
+        variants. When supplied they are normalized (original query forced to
+        the front, de-duplicated, capped); when omitted, deterministic lexical
+        variants are used. ``query`` itself is always the rerank reference.
+
         ``modified_after``/``modified_before`` (ISO-8601, UTC-normalized)
         restrict recall to items modified within the inclusive range; applied
         at the recall layer so RRF fusion and reranking only see in-range
         candidates.
         """
-        sub_queries = self.expander.expand(query)
-        if not sub_queries:
-            sub_queries = [query]
+        # Caller-supplied sub-queries win; otherwise fall back to the
+        # deterministic lexical expander. Either way ``query`` itself is
+        # guaranteed present (it's the rerank reference) and the list is
+        # non-empty for a non-empty query.
+        if sub_queries is not None:
+            sub_queries = _normalize_sub_queries(sub_queries, query)
+        else:
+            sub_queries = self.expander.expand(query) or [query]
 
         conn = get_connection()
         try:

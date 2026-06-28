@@ -138,27 +138,18 @@ class EmbeddingSettings:
 
 
 @dataclass(frozen=True)
-class LLMSettings:
-    """Optional chat LLM for Multi-Query expansion.
-
-    The provided Azure gateway only exposes embeddings, so multi-query LLM
-    generation is opt-in: set these vars (e.g. to a local vLLM/Ollama or a
-    full OpenAI deployment) and the RAG pipeline will expand queries;
-    otherwise it falls back to deterministic lexical variants.
-    """
-    base_url: str = _get("LLM_BASE_URL", "")
-    api_key: str = _get("LLM_API_KEY", "")
-    model: str = _get("LLM_MODEL", "gpt-4o-mini")
-    timeout: int = _get_int("LLM_TIMEOUT", 30)
-
-
-@dataclass(frozen=True)
 class RerankerSettings:
     """Local Qwen3-Reranker-0.6B (CPU)."""
     model_name: str = _get("RERANKER_MODEL", "Qwen/Qwen3-Reranker-0.6B")
-    # Max candidate pairs scored in one forward pass (memory bound).
-    batch_size: int = _get_int("RERANKER_BATCH_SIZE", 16)
-    max_length: int = _get_int("RERANKER_MAX_LENGTH", 512)
+    # Max candidate pairs scored in one forward pass (memory bound). The Qwen3
+    # reranker is a full causal LM (vocab ~152k); each batch of N×max_length
+    # tokens produces an [N, max_length, vocab] logits tensor. At batch=16,
+    # max_length=512 that single tensor is ~5 GB (fp32) — the prior OOM cause.
+    # batch=4 keeps the peak well under 1 GB while staying fast enough.
+    batch_size: int = _get_int("RERANKER_BATCH_SIZE", 4)
+    # 256 is ample for (query + chunk) relevance; 512 doubled memory for no
+    # recall gain since chunks are already capped at chunk_size in indexing.
+    max_length: int = _get_int("RERANKER_MAX_LENGTH", 256)
     # If model loading fails, degrade to RRF-only scoring instead of crashing.
     allow_fallback: bool = _get("RERANKER_ALLOW_FALLBACK", "1") == "1"
     device: str = _get("RERANKER_DEVICE", "cpu")
@@ -218,7 +209,6 @@ class ChunkSettings:
 class Settings:
     jama: JamaSettings = field(default_factory=JamaSettings)
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
-    llm: LLMSettings = field(default_factory=LLMSettings)
     reranker: RerankerSettings = field(default_factory=RerankerSettings)
     storage: StorageSettings = field(default_factory=StorageSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
@@ -245,10 +235,9 @@ REQUIRED_VARS_AZURE_EMB = [
     ("EMBEDDING_API_KEY", "Embedding API key", "embedding"),
 ]
 
-OPTIONAL_VARS = [
-    ("LLM_BASE_URL", "Chat LLM endpoint (Multi-Query expansion)", "llm"),
-    ("LLM_API_KEY", "Chat LLM API key", "llm"),
-]
+# No optional chat-LLM vars remain: Multi-Query expansion is performed by the
+# MCP LLM client and passed to the pipeline via ``search(sub_queries=...)``.
+OPTIONAL_VARS: list[tuple[str, str, str]] = []
 
 
 def _required_vars() -> list[tuple[str, str, str]]:
@@ -308,7 +297,6 @@ _ENV_KEYS = [
     "JAMA_PAGE_SIZE", "JAMA_PAGE_DELAY",
     "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
     "EMBEDDING_DIMENSIONS", "EMBEDDING_KEY_HEADER",
-    "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL",
     "RERANKER_MODEL", "RERANKER_DEVICE", "RERANKER_ALLOW_FALLBACK",
     "JAMA_MCP_DB_PATH", "SQLITE_BUSY_TIMEOUT_MS",
     "SYNC_ENABLED", "SYNC_INTERVAL_HOURS",
@@ -352,7 +340,6 @@ def reload_settings() -> None:
         pass
     settings.jama = JamaSettings()
     settings.embedding = EmbeddingSettings()
-    settings.llm = LLMSettings()
     settings.reranker = RerankerSettings()
     settings.storage = StorageSettings()
     settings.sync = SyncSettings()

@@ -3,7 +3,7 @@
 Exposes four tools to LLM clients via the Model Context Protocol:
   * init_jama_project        - async background init (returns job_id)
   * get_sync_progress        - poll job progress
-  * search_jama_semantics    - high-precision RAG (multi-query + hybrid + RRF + rerank)
+  * search_jama_semantics    - high-precision RAG (client multi-query + hybrid + RRF + rerank)
   * query_jama_native_metadata - direct Jama REST filtering (exact metadata)
 
 Also runs an APScheduler job that incrementally syncs initialized projects
@@ -48,6 +48,24 @@ _rag: RAGPipeline | None = None
 _init_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jama-job")
 
+# Per-project sync locks. ``_sync_project`` acquires the lock for its project
+# so that a user-triggered init and a scheduler-triggered incremental sync can
+# never run concurrently for the SAME project (which would race on upserts and
+# could leave a split-brain terminal state). Different projects still run in
+# parallel. The dict is guarded by ``_init_lock``; the per-project Lock is
+# held only for the duration of one sync.
+_project_locks: dict[int, threading.Lock] = {}
+
+
+def _project_lock(project_id: int) -> threading.Lock:
+    """Return (creating if needed) the sync lock for ``project_id``."""
+    with _init_lock:
+        lk = _project_locks.get(project_id)
+        if lk is None:
+            lk = threading.Lock()
+            _project_locks[project_id] = lk
+        return lk
+
 # Server-level instructions sent to the LLM client alongside the tool list.
 # This is the canonical MCP way to steer tool selection: it tells the model
 # to DEFAULT to fusion retrieval and only fall back to native metadata for
@@ -80,8 +98,16 @@ tools below when the user gives an exact, unambiguous key — not a topic:
 ROUTING RULE OF THUMB: if the user's intent can be expressed as a search
 box query → `search_jama_semantics`. If it is "show me item X" or "list
 all Y" → the native/browse tools. When unsure, prefer fusion search; it
-is召回-oriented and surfaces the most relevant items even for near-keyword
-phrasing, while native tools return empty on any misspelling or mismatch.
+is recall-oriented and surfaces the most relevant items even for
+near-keyword phrasing, while native tools return empty on any
+misspelling or mismatch.
+
+QUERY EXPANSION: before calling `search_jama_semantics`, rewrite the
+user's query into 3-5 diverse sub-queries (different semantic angles —
+synonyms, broader/narrower scope, related concepts) and pass them via
+the `sub_queries` parameter; keep the original query in `query` (it is
+the rerank reference). This maximizes recall for RRF fusion and is
+preferred over letting the server fall back to lexical variants.
 
 PREREQUISITE: `search_jama_semantics` needs the project initialized first
 (`init_jama_project` → poll `get_sync_progress` until DONE). The native
@@ -162,6 +188,18 @@ def _ensure_ready(require: set[str]) -> dict | None:
 # --------------------------------------------------------------------------- #
 def _sync_project(project_id: int, *, job_id: str | None,
                   incremental: bool) -> None:
+    """Download, clean, chunk, embed and index a project's items.
+
+    Serializes per-project: a user init and a scheduler incremental sync for
+    the SAME project can't run at once (they'd race on upserts). Different
+    projects still sync in parallel.
+    """
+    with _project_lock(project_id):
+        _sync_project_locked(project_id, job_id=job_id, incremental=incremental)
+
+
+def _sync_project_locked(project_id: int, *, job_id: str | None,
+                         incremental: bool) -> None:
     """Download, clean, chunk, embed and index a project's items."""
     conn = db()
     last_sync = None
@@ -364,14 +402,29 @@ def _sync_project(project_id: int, *, job_id: str | None,
 
 
 def _run_job(project_id: int, job_id: str, incremental: bool) -> None:
-    """Background worker: runs sync then guarantees terminal job state."""
+    """Background worker: runs sync then guarantees terminal job state.
+
+    The error path is defensive: if marking the job/project ERROR itself fails
+    (e.g. DB locked past busy_timeout), that secondary failure is logged rather
+    than swallowed, so the failure is never silent and the job never lingers in
+    a phantom RUNNING state without a breadcrumb.
+    """
     conn = db()
     try:
         _sync_project(project_id, job_id=job_id, incremental=incremental)
     except Exception as exc:
         log.error("Job %s failed: %s\n%s", job_id, exc, traceback.format_exc())
-        update_job(conn, job_id, status="ERROR", message=str(exc)[:500])
-        upsert_project(conn, project_id, status="ERROR", error=str(exc)[:500])
+        try:
+            update_job(conn, job_id, status="ERROR", message=str(exc)[:500])
+            upsert_project(conn, project_id, status="ERROR",
+                           error=str(exc)[:500])
+        except Exception as db_exc:
+            # The terminal-state write itself failed. Log loudly so it isn't
+            # lost; the job row stays RUNNING, but _resume_interrupted_syncs
+            # will re-queue the (still-INITIALIZING) project on next startup.
+            log.error("Job %s: could not persist ERROR state (%s). Project "
+                      "%s may need manual recovery.", job_id, db_exc,
+                      project_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -397,11 +450,46 @@ def init_jama_project(project_id: str) -> dict:
         pid = int(project_id)
     except (TypeError, ValueError):
         return {"error": "project_id must be a numeric string"}
-    job_id = f"init-{uuid.uuid4().hex[:12]}"
     conn = db()
-    create_job(conn, job_id, pid, "init")
-    upsert_project(conn, pid, status="INITIALIZING")
-    _executor.submit(_run_job, pid, job_id, incremental=False)
+    # Reentrancy guard: refuse a duplicate concurrent sync. If a job is already
+    # RUNNING/PENDING for a project that is still INITIALIZING, hand back its id
+    # instead of spawning a second _run_job thread — two concurrent syncs of the
+    # same project race on upserts and can leave a split-brain terminal state
+    # (one ERROR, one READY). If the project already reached a terminal state
+    # (READY/ERROR) the job row is stale (zombie) and re-init is allowed.
+    # The check + create run under a lock-protected critical section. (We can't
+    # wrap them in one write_txn because create_job/upsert_project each open
+    # their own transaction; SQLite forbids BEGIN within BEGIN. The lock is
+    # sufficient because there is a single shared db() connection and a single
+    # writer at a time.)
+    from db_setup import get_active_job_for_project
+    with _init_lock:
+        proj = get_project(conn, pid)
+        proj_status = proj["status"] if proj else None
+        active = get_active_job_for_project(conn, pid)
+        if active is not None and proj_status == "INITIALIZING":
+            return {"job_id": active["job_id"], "project_id": pid,
+                    "status": "RUNNING",
+                    "note": f"A sync is already in progress for project "
+                            f"{pid}; reuse job_id {active['job_id']}"}
+        job_id = f"init-{uuid.uuid4().hex[:12]}"
+        create_job(conn, job_id, pid, "init")
+        upsert_project(conn, pid, status="INITIALIZING")
+    # Submit outside the txn (the worker opens its own conn). If submission
+    # itself fails (executor shut down), roll back the job so the project
+    # isn't left stuck INITIALIZING with a phantom RUNNING job.
+    try:
+        _executor.submit(_run_job, pid, job_id, incremental=False)
+    except Exception as exc:
+        log.error("Could not submit init job %s: %s", job_id, exc)
+        try:
+            update_job(conn, job_id, status="ERROR",
+                       message=f"Submit failed: {exc}")
+            upsert_project(conn, pid, status="ERROR",
+                           error=f"Submit failed: {exc}")
+        except Exception:
+            pass
+        return {"error": f"Could not start sync job: {exc}"}
     log.info("Started init job %s for project %s", job_id, pid)
     return {"job_id": job_id, "project_id": pid, "status": "RUNNING"}
 
@@ -438,6 +526,7 @@ def get_sync_progress(job_id: str) -> dict:
 
 @mcp.tool()
 def search_jama_semantics(project_id: str, query: str,
+                          sub_queries: list[str] = None,
                           item_type: str = None, top_k: int = 5,
                           candidate_k: int = 50,
                           modified_after: str = None,
@@ -450,12 +539,25 @@ def search_jama_semantics(project_id: str, query: str,
     all best answered here. Prefer it over native metadata unless the user
     gives an exact document key / status / item id.
 
-    Pipeline: Multi-Query expansion -> hybrid recall (sqlite-vec + FTS5) ->
-    RRF fusion -> local Qwen3-Reranker-0.6B -> top_k results.
+    Pipeline: client Multi-Query expansion -> hybrid recall (sqlite-vec +
+    FTS5) -> RRF fusion -> local Qwen3-Reranker-0.6B -> top_k results.
 
     Args:
         project_id: numeric string Jama project id (must be initialized first).
-        query: natural-language search query.
+        query: the ORIGINAL natural-language search query, verbatim. It is
+               always the rerank reference, so even when `sub_queries` is
+               supplied you MUST pass the original user query here too.
+        sub_queries: RECOMMENDED. Rewrite `query` into 3-5 diverse search
+                     sub-queries capturing different semantic angles
+                     (synonyms, broader/narrower scope, related concepts) to
+                     maximize recall for RRF fusion. Pass as a JSON array of
+                     strings. The server normalizes them (forces `query` to the
+                     front, de-duplicates, caps at 5). If omitted, the server
+                     falls back to deterministic lexical variants.
+                     Example for query "how does login timeout work":
+                       ["login session expiration",
+                        "authentication timeout policy",
+                        "user inactivity logout"]
         item_type: optional Jama item-type id to filter (e.g. "89011" for Test
                    Cases, "89009" for Requirements). Pass None for all.
         top_k: final results to return (default 5).
@@ -467,8 +569,9 @@ def search_jama_semantics(project_id: str, query: str,
                          (inclusive). Naive timestamps are assumed UTC.
 
     Returns:
-        {"project_id","query","results":[{document_key,name,item_type_name,
-        section,modified_date,text,score,strategy}, ...]}
+        {"project_id","query","sub_queries_used","results":
+        [{document_key,name,item_type_name,section,modified_date,text,
+        score,strategy}, ...]}
     """
     not_ready = _ensure_ready({"jama", "embedding"})
     if not_ready:
@@ -479,6 +582,17 @@ def search_jama_semantics(project_id: str, query: str,
         return {"error": "project_id must be a numeric string"}
     if not query or not query.strip():
         return {"error": "query is required"}
+
+    # Normalize caller-supplied sub-queries defensively. A non-list value is a
+    # client bug (the schema declares array of string); report it clearly. We
+    # filter out non-string / blank entries and drop to None when nothing
+    # usable remains, so the pipeline falls back to lexical expansion.
+    if sub_queries is not None:
+        if not isinstance(sub_queries, list):
+            return {"error": "sub_queries must be an array of strings"}
+        cleaned = [s.strip() for s in sub_queries
+                   if isinstance(s, str) and s.strip()]
+        sub_queries = cleaned or None
 
     conn = db()
     proj = get_project(conn, pid)
@@ -496,6 +610,22 @@ def search_jama_semantics(project_id: str, query: str,
         except (TypeError, ValueError):
             return {"error": "item_type must be a numeric string or null"}
 
+    # Clamp result/pool sizes to sane bounds. candidate_k=0 would yield an
+    # empty pool (silently zero results); top_k > candidate_k returns fewer
+    # than requested; huge values cause excessive vector/FTS work.
+    try:
+        top_k = int(top_k)
+        candidate_k = int(candidate_k)
+    except (TypeError, ValueError):
+        return {"error": "top_k and candidate_k must be integers"}
+    if top_k < 1 or top_k > 50:
+        return {"error": "top_k must be between 1 and 50"}
+    if candidate_k < 1 or candidate_k > 500:
+        return {"error": "candidate_k must be between 1 and 500"}
+    if top_k > candidate_k:
+        return {"error": f"top_k ({top_k}) cannot exceed candidate_k "
+                         f"({candidate_k})"}
+
     # Validate (and UTC-normalize) the time bounds early so a bad format is
     # reported as a clean error rather than a 500 mid-search.
     try:
@@ -512,14 +642,26 @@ def search_jama_semantics(project_id: str, query: str,
         return {"error": f"Invalid timestamp: {exc}"}
 
     try:
-        results = rag().search(pid, query.strip(), item_type=it,
+        results = rag().search(pid, query.strip(),
+                               sub_queries=sub_queries,
+                               item_type=it,
                                top_k=top_k, candidate_k=candidate_k,
                                modified_after=modified_after,
                                modified_before=modified_before)
     except Exception as exc:
         log.error("search failed: %s\n%s", exc, traceback.format_exc())
         return {"error": f"Search failed: {exc}"}
-    return {"project_id": pid, "query": query, "count": len(results),
+    # Echo the query variants actually used by the pipeline so the caller can
+    # verify expansion happened. Computed defensively so a reflection failure
+    # never discards already-computed search results.
+    try:
+        from rag_pipeline import _normalize_sub_queries
+        used = _normalize_sub_queries(sub_queries or [], query.strip())
+    except Exception:
+        used = [query.strip()] if query.strip() else []
+    return {"project_id": pid, "query": query,
+            "sub_queries_used": used,
+            "count": len(results),
             "modified_after": modified_after,
             "modified_before": modified_before,
             "results": results}
@@ -952,8 +1094,14 @@ def query_jama_endpoint(path: str, params: str = None,
         parsed = {k: v[0] if len(v) == 1 else v
                   for k, v in parse_qs(params).items()}
     try:
+        # Cap all-pages walks at 50 pages (≤2500 rows at page_size=50) so a
+        # broad endpoint can't trigger an unbounded full-scan that exhausts
+        # memory/network. Callers needing more should page explicitly.
         data = jama().get_raw(path, params=parsed,
-                              max_pages=None if all_pages else 1)
+                              max_pages=50 if all_pages else 1)
+    except ValueError as exc:
+        # Path sanitization rejection from get_raw.
+        return {"error": str(exc)}
     except Exception as exc:
         log.error("query_jama_endpoint failed: %s\n%s",
                   exc, traceback.format_exc())
@@ -1028,7 +1176,7 @@ def configure_jama(values: dict) -> dict:
     Args:
         values: dict of {ENV_VAR: value}. Recognized keys: JAMA_URL,
                 JAMA_CLIENT_ID, JAMA_CLIENT_SECRET, EMBEDDING_BASE_URL,
-                EMBEDDING_API_KEY, LLM_BASE_URL, LLM_API_KEY, JAMA_MCP_DB_PATH,
+                EMBEDDING_API_KEY, JAMA_MCP_DB_PATH,
                 and any other key in the .env template.
 
     Returns:

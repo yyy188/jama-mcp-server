@@ -34,6 +34,28 @@ log = logging.getLogger(__name__)
 # the presence of ``testCaseSteps`` to be robust across tenants.
 _TEST_STEPS_KEY = "testCaseSteps"
 
+# Hard cap on consecutive 429 retries for a single logical request. A
+# persistent rate-limit (or a misbehaving gateway) used to drive unbounded
+# recursion in ``_get``; this bounds it so the call fails cleanly instead of
+# hanging for hours or blowing the stack.
+_MAX_429_RETRIES = 5
+
+
+def _parse_retry_after(value: str | None) -> float:
+    """Parse a ``Retry-After`` header into seconds.
+
+    The header is RFC-permitted to be either a non-negative integer (seconds)
+    or an HTTP-date. We only honor the integer form (what Jama emits); a
+    non-numeric value falls back to a short default instead of crashing the
+    request with ``ValueError``.
+    """
+    if not value:
+        return 5.0
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 5.0
+
 
 # --------------------------------------------------------------------------- #
 # HTML cleaning
@@ -107,8 +129,19 @@ def _build_session() -> requests.Session:
         raise_on_status=False,
         respect_retry_after_header=True,
     )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://", HTTPAdapter(max_retries=retry))
+    # Size the connection pool to the download concurrency. Without this,
+    # HTTPAdapter defaults to pool_maxsize=10 while iter_pages_concurrent runs
+    # ``download_concurrency`` (default 16) workers on the SAME session: the
+    # excess workers churn connections ("Connection pool is full, discarding
+    # connection") and pay TCP+TLS rehandshake on every page — a measured
+    # bottleneck on large projects (Lyra, 5076 items). Pooling at the
+    # concurrency level keeps every worker on a reused keep-alive connection.
+    pool = max(settings.sync.download_concurrency, 10)
+    adapter = HTTPAdapter(max_retries=retry,
+                          pool_connections=pool, pool_maxsize=pool)
+    s.mount("https://", adapter)
+    s.mount("http://", HTTPAdapter(max_retries=retry,
+                                   pool_connections=pool, pool_maxsize=pool))
     s.headers.update({"Accept": "application/json"})
     return s
 
@@ -173,19 +206,29 @@ class JamaClient:
     # ----- single GET (with token refresh + 429 backoff) ---------------- #
     def _get(self, path: str, params: dict | None = None) -> dict:
         url = f"{settings.jama.url}{settings.jama.api_prefix}{path}"
-        r = self._s.get(url, headers=self._headers(), params=params or {},
-                        timeout=settings.jama.request_timeout)
-        # 401 -> token may have been revoked mid-flight; refresh once.
-        if r.status_code == 401:
-            with self._lock:
-                self._token = None
+        # 401 refresh is single-shot per call (matches the page-fetch path).
+        # 429 uses a BOUNDED loop (not recursion) so a persistent rate-limit
+        # fails cleanly after ``_MAX_429_RETRIES`` instead of recursing until
+        # the stack overflows.
+        refreshed = False
+        for _ in range(_MAX_429_RETRIES + 1):
             r = self._s.get(url, headers=self._headers(), params=params or {},
                             timeout=settings.jama.request_timeout)
-        if r.status_code == 429:  # explicit backoff beyond urllib3's handling
-            retry_after = int(r.headers.get("Retry-After", "5") or 5)
-            log.warning("Jama 429 rate limit; sleeping %ss", retry_after)
-            time.sleep(min(retry_after, 30))
-            return self._get(path, params)
+            # 401 -> token may have been revoked mid-flight; refresh once.
+            if r.status_code == 401 and not refreshed:
+                with self._lock:
+                    self._token = None
+                refreshed = True
+                r = self._s.get(url, headers=self._headers(), params=params or {},
+                                timeout=settings.jama.request_timeout)
+            if r.status_code == 429:  # explicit backoff beyond urllib3's handling
+                retry_after = _parse_retry_after(r.headers.get("Retry-After"))
+                log.warning("Jama 429 rate limit; sleeping %ss", retry_after)
+                time.sleep(min(retry_after, 30))
+                continue
+            r.raise_for_status()
+            return r.json()
+        # Exhausted 429 retries: raise so callers see a real failure.
         r.raise_for_status()
         return r.json()
 
@@ -201,16 +244,21 @@ class JamaClient:
         cfg = settings.jama
         url = f"{cfg.url}{cfg.api_prefix}{path}"
         last_err: Exception | None = None
+        refreshed = False  # guard: refresh token at most once per page
         for attempt in range(1, cfg.page_max_retries + 1):
             t0 = time.monotonic()
             try:
                 r = self._s.get(url, headers=self._headers(), params=params,
                                 timeout=cfg.request_timeout)
-                if r.status_code == 401:
+                if r.status_code == 401 and not refreshed:
+                    # Token expired/revoked mid-pagination: refresh once and
+                    # retry this page immediately (don't burn a retry slot).
                     with self._lock:
                         self._token = None
+                    refreshed = True
+                    continue
                 if r.status_code == 429:
-                    retry_after = int(r.headers.get("Retry-After", "5") or 5)
+                    retry_after = _parse_retry_after(r.headers.get("Retry-After"))
                     log.warning("Jama 429 rate limit; sleeping %ss", retry_after)
                     time.sleep(min(retry_after, 30))
                     continue
@@ -223,9 +271,12 @@ class JamaClient:
                         f"Jama page fetch too slow: {bps:.0f} bytes/s < floor "
                         f"{cfg.page_min_bytes_per_sec} (attempt "
                         f"{attempt}/{cfg.page_max_retries})")
+                # JSON parse failure (e.g. a truncated/HTML proxy body on a
+                # 200) is retried like a transient stall instead of aborting
+                # the whole download.
                 return r.json()
             except (requests.Timeout, requests.ConnectionError,
-                    NetworkTooSlowError) as exc:
+                    NetworkTooSlowError, ValueError) as exc:
                 last_err = exc
                 log.warning("Jama page fetch attempt %d/%d stalled/errored: "
                             "%s", attempt, cfg.page_max_retries, exc)
@@ -318,16 +369,28 @@ class JamaClient:
 
     # ----- item types ---------------------------------------------------- #
     def load_item_types(self) -> dict[int, str]:
-        """Cache and return {itemType id -> display name}."""
+        """Cache and return {itemType id -> display name}.
+
+        The cache is populated only on a fully successful fetch: a partial
+        result set (pagination that errors mid-way) is NOT cached, otherwise
+        the top guard would prevent a retry and missing types would render as
+        ``"Type {id}"`` permanently until restart.
+        """
         if self._item_types:
             return self._item_types
+        found: dict[int, str] = {}
         try:
             for it in self._paginate("/itemtypes", max_pages=5):
                 if isinstance(it, dict):
-                    self._item_types[it.get("id")] = it.get("display") or \
+                    found[it.get("id")] = it.get("display") or \
                         it.get("displayPlural") or str(it.get("id"))
         except Exception as exc:
             log.warning("Could not load item types: %s", exc)
+            # Return whatever we found WITHOUT caching it, so the next call
+            # retries. An empty/partial dict is better than nothing for this
+            # call, but must not be frozen into the cache.
+            return found
+        self._item_types = found
         return self._item_types
 
     def item_type_name(self, item_type_id: int | None) -> str:
@@ -510,7 +573,23 @@ class JamaClient:
         ``path`` is appended to ``{url}{api_prefix}`` (e.g. ``"/projects"``).
         With ``max_pages=1`` (default) returns the first page's ``data``;
         with ``max_pages=None`` walks all pages and returns a flat list.
+
+        ``path`` is sanitized: it must be a relative REST path starting with
+        ``/``. Query strings (``?``) and fragments (``#``) are rejected —
+        callers must pass query parameters via ``params`` so they are properly
+        URL-encoded — and absolute URLs are rejected to prevent SSRF.
         """
+        if not isinstance(path, str) or not path:
+            raise ValueError("path must be a non-empty string")
+        p = path.strip()
+        if not p.startswith("/"):
+            raise ValueError("path must start with '/' (a relative REST path)")
+        if "://" in p:
+            raise ValueError("path must be relative, not an absolute URL")
+        if "?" in p or "#" in p:
+            raise ValueError("path must not contain '?' or '#'; "
+                             "pass query parameters via the `params` argument")
+        path = p
         if max_pages == 1:
             data = self._get(path, params=params)
             return data.get("data", []) if isinstance(data, dict) else data

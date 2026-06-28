@@ -33,8 +33,7 @@ _CORE_DEPS = [
 ]
 _OPTIONAL_DEPS = [
     ("mcp", "MCP framework (FastMCP)"),
-    ("llama_index.core", "LlamaIndex chunking / Multi-Query"),
-    ("llama_index.llms.openai", "LlamaIndex OpenAI LLM (optional Multi-Query)"),
+    ("llama_index.core", "LlamaIndex chunking"),
     ("transformers", "local Qwen3 reranker"),
     ("torch", "local Qwen3 reranker"),
 ]

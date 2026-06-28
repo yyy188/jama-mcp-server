@@ -487,3 +487,19 @@ def get_job(conn: sqlite3.Connection, job_id: str) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM sync_jobs WHERE job_id=?", (job_id,)
     ).fetchone()
+
+
+def get_active_job_for_project(conn: sqlite3.Connection,
+                               project_id: int) -> sqlite3.Row | None:
+    """Return the most recent non-terminal job for a project, or None.
+
+    A job is "active" while in PENDING or RUNNING status. Used by
+    ``init_jama_project`` to refuse a duplicate concurrent sync for a project
+    that already has one in flight (prevents racing upserts and split-brain
+    terminal states). Call within a write_txn for a consistent read.
+    """
+    return conn.execute(
+        "SELECT * FROM sync_jobs WHERE project_id=? AND status IN "
+        "('PENDING','RUNNING') ORDER BY started_at DESC LIMIT 1",
+        (project_id,)
+    ).fetchone()

@@ -46,3 +46,9 @@ user/
 .DS_Store
 Thumbs.db
 desktop.ini
+probe/
+
+# ====== Performance test artifacts ======
+lyra_*.log
+lyra_*.json
+*_sync_metrics.json

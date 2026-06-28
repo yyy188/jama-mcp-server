@@ -323,6 +323,68 @@ def test_crash_recovery(project_id: int) -> None:
     conn.close()
 
 
+def test_search_subqueries(project_id: int) -> None:
+    """Read-only RAG search: caller-supplied sub_queries vs lexical fallback.
+
+    Runs only on an already-indexed project (test_concurrent_sync leaves a
+    small one READY). All Jama access is read-only — search hits only the
+    local SQLite index; no Jama REST calls, no online writes.
+    """
+    section("8d. search_jama_semantics (sub_queries + lexical fallback)")
+    import server
+    from db_setup import init_db, get_project, count_chunks
+    conn = init_db()
+    proj = get_project(conn, project_id)
+    if proj is None or proj["status"] != "READY" or count_chunks(conn, project_id) == 0:
+        _skip("search sub_queries",
+              f"project {project_id} not indexed (status="
+              f"{proj['status'] if proj else 'None'}, "
+              f"chunks={count_chunks(conn, project_id)})")
+        conn.close()
+        return
+
+    # Pick a generic keyword likely present in any real project. Derive it
+    # from the first indexed chunk's text so the search is never empty.
+    row = conn.execute(
+        "SELECT text FROM chunks WHERE project_id=? LIMIT 1", (project_id,)
+    ).fetchone()
+    conn.close()
+    if row is None or not row["text"]:
+        _skip("search sub_queries", "no chunk text available to probe")
+        return
+    # First meaningful token of the first chunk = a near-guaranteed hit.
+    import re as _re
+    tokens = _re.findall(r"[A-Za-z0-9_-]+", row["text"])
+    probe = tokens[0] if tokens else "test"
+
+    try:
+        rag = server.rag()
+        # (a) Caller supplies sub_queries (the Plan B happy path).
+        r_sub = rag.search(project_id, probe,
+                           sub_queries=[probe, f"{probe} requirement",
+                                        f"{probe} description"],
+                           top_k=3, candidate_k=20)
+        # (b) No sub_queries -> lexical fallback path.
+        r_lex = rag.search(project_id, probe, top_k=3, candidate_k=20)
+    except Exception as exc:
+        _fail("search sub_queries", f"raised: {exc}")
+        return
+
+    if r_sub and r_lex:
+        _ok("search sub_queries",
+            f"sub_queries={len(r_sub)} results, lexical={len(r_lex)} results")
+        strategies = {r["strategy"] for r in r_sub + r_lex}
+        if strategies <= {"rerank", "rrf"}:
+            _ok("search strategy", f"strategies={sorted(strategies)}")
+        else:
+            _fail("search strategy",
+                  f"unexpected strategy: {sorted(strategies)}")
+    else:
+        _fail("search sub_queries",
+              f"empty results: sub={len(r_sub)} lex={len(r_lex)} "
+              f"(probe={probe!r})")
+
+
 def test_mcp_tools_registered() -> None:
     section("9. MCP tools registered")
     # Import server (registers @mcp.tool() decorators) without running it.
@@ -357,6 +419,26 @@ def test_mcp_tools_registered() -> None:
         _fail("tool registration", f"missing tools: {sorted(missing)}")
     else:
         _ok("tool registration", f"{len(expected)} tools present")
+
+    # Assert search_jama_semantics exposes the client-side Multi-Query
+    # parameter (Plan B): sub_queries is an array of strings, optional.
+    # ``parameters`` is a plain dict on the installed FastMCP version; fall
+    # back to the pydantic model path for newer versions.
+    try:
+        st = tools.get("search_jama_semantics")
+        params = st.parameters  # type: ignore[union-attr]
+        schema = (params.model_json_schema()           # type: ignore[union-attr]
+                  if hasattr(params, "model_json_schema") else params)
+        props = schema.get("properties", {})
+        sq = props.get("sub_queries", {})
+        if sq.get("type") == "array" and sq.get("items", {}).get("type") == "string":
+            _ok("sub_queries schema",
+                f"array<string>, default={sq.get('default')!r}")
+        else:
+            _fail("sub_queries schema",
+                  f"expected array<string>; got {sq}")
+    except Exception as exc:
+        _fail("sub_queries schema", f"could not introspect: {exc}")
 
 
 def test_preflight_guard_blocks() -> None:
@@ -449,6 +531,8 @@ def main() -> int:
     if small_pid:
         test_concurrent_sync(jama, small_pid)
         test_crash_recovery(small_pid)
+        # Reuses the project indexed by test_concurrent_sync (read-only).
+        test_search_subqueries(small_pid)
     else:
         _skip("concurrent sync + crash recovery",
               "no small (<=50 items) project found")

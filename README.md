@@ -28,10 +28,12 @@ between semantic search and structured metadata queries.
 
 ## Retrieval pipeline (`search_jama_semantics`)
 
-1. **Multi-Query** — the query is expanded into 3 sub-queries. Uses **LlamaIndex**
-   (`PromptTemplate` + `OpenAI` LLM via `llama-index-llms-openai`) when
-   `LLM_BASE_URL` is configured, otherwise deterministic lexical variants
-   (stopword-stripped + truncated) so RRF fusion still helps without an LLM.
+1. **Multi-Query** — the query is expanded into 3-5 sub-queries. The MCP LLM
+   client performs the expansion and passes the variants via the
+   `sub_queries` parameter; when none are supplied, the server falls back to
+   deterministic lexical variants (stopword-stripped + truncated) so RRF
+   fusion still benefits from multiple recall angles. No server-side chat
+   LLM is configured or called.
 2. **Hybrid recall** — for each sub-query: vector recall (sqlite-vec, cosine)
    + keyword recall (FTS5, BM25), each capped at `candidate_k`.
 3. **RRF fusion** — Reciprocal Rank Fusion merges all ranked lists into one
@@ -41,6 +43,31 @@ between semantic search and structured metadata queries.
    returned. If the model is unavailable, the pipeline gracefully falls back to
    RRF scores. Model weights are fetched from the HuggingFace China mirror
    (`HF_ENDPOINT=https://hf-mirror.com`) on first use, then served from cache.
+
+## Reliability & crash recovery
+
+The server is designed to survive crashes without losing data and to come back
+up consistent on restart:
+
+- **Atomic per-item indexing** — each item's chunks (text + FTS5 + sqlite-vec)
+  are replaced in a single `write_txn` (`BEGIN IMMEDIATE`), so a crash mid-sync
+  never leaves a half-written item. `done`/`progress` only advance *after* the
+  commit, so the DB is consistent up to the last flushed batch.
+- **Idempotent re-sync** — upserts overwrite (never duplicate), so
+  re-processing already-indexed items on resume is harmless.
+- **Startup recovery** — `_resume_interrupted_syncs` re-queues any project left
+  `INITIALIZING` by a prior crash, so the server self-heals without manual
+  action.
+- **Concurrency guard** — `init_jama_project` refuses a duplicate concurrent
+  sync for a project that already has a job in flight, returning the existing
+  `job_id` instead of spawning a racing second worker.
+- **Bounded HTTP retries** — 429 rate-limit handling is a bounded loop (not
+  recursion), so a persistent rate-limit fails cleanly instead of overflowing
+  the stack; `Retry-After` parsing tolerates non-numeric values; a 401 mid-sync
+  refreshes the token and retries the page; malformed JSON bodies are retried.
+- **WAL mode + write lock** — SQLite runs in WAL with a process-wide write
+  lock, so the scheduler's writer and MCP reader threads coexist without
+  `SQLITE_BUSY` failures.
 
 ## Chunking (LlamaIndex)
 
@@ -177,6 +204,7 @@ The **Qwen3-Reranker-0.6B** was downloaded from the HuggingFace China mirror
 (`hf-mirror.com`) and loaded on CPU; verified it produces non-zero relevance
 scores with correct ordering (related=0.55 > unrelated=0.0002) and that the
 end-to-end RAG search returns `strategy=rerank` results. **LlamaIndex** is the
-primary RAG framework: `SentenceSplitter` + `Document`/`TextNode` for chunking,
-and `PromptTemplate` + `OpenAI` LLM for Multi-Query expansion (with a
-deterministic fallback when no LLM endpoint is configured).
+primary RAG framework: `SentenceSplitter` + `Document`/`TextNode` for chunking.
+Multi-Query expansion is performed by the MCP LLM client and passed to the
+pipeline via `search(sub_queries=...)`; when omitted, deterministic lexical
+variants are used.

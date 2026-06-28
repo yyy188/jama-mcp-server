@@ -22,10 +22,9 @@ urllib3>=2.0.0
 sqlite-vec>=0.1.6
 # FTS5 is bundled with CPython's sqlite3 module (no extra package needed).
 
-# --- LlamaIndex (primary RAG framework: SentenceSplitter, Document/TextNode,
-#     PromptTemplate, OpenAI LLM for Multi-Query expansion) ---
+# --- LlamaIndex (primary RAG framework: SentenceSplitter + Document/TextNode
+#     for chunking; Multi-Query expansion is done by the MCP LLM client) ---
 llama-index-core>=0.11.0
-llama-index-llms-openai>=0.2.0
 
 # --- HTML cleaning for Jama rich-text fields ---
 beautifulsoup4>=4.12.0
