@@ -398,6 +398,248 @@ class JamaClient:
                 break
         return results
 
+    # ----- extended read-only query API (browse Jama beyond items) -------- #
+    # Every method here is a thin wrapper around the read-only GET machinery
+    # above (OAuth, pagination, retry). They expose the rest of Jama's REST
+    # query surface to the MCP client as discrete tools; ``get_raw`` is the
+    # power-user escape hatch that supports *any* GET endpoint.
+
+    def get_raw(self, path: str, params: dict | None = None,
+                *, max_pages: int | None = 1) -> dict | list:
+        """Generic read-only GET against any Jama REST endpoint.
+
+        ``path`` is appended to ``{url}{api_prefix}`` (e.g. ``"/projects"``).
+        With ``max_pages=1`` (default) returns the first page's ``data``;
+        with ``max_pages=None`` walks all pages and returns a flat list.
+        """
+        if max_pages == 1:
+            data = self._get(path, params=params)
+            return data.get("data", []) if isinstance(data, dict) else data
+        return list(self._paginate(path, params, max_pages=max_pages))
+
+    def list_projects(self) -> list[dict]:
+        """All projects visible to the OAuth client."""
+        out = []
+        for p in self._paginate("/projects", max_pages=50):
+            f = p.get("fields", {}) or {}
+            out.append({
+                "id": p.get("id"),
+                "project_key": p.get("projectKey"),
+                "name": f.get("name"),
+                "status": f.get("status"),
+                "description": clean_html(f.get("description", ""))[:300],
+            })
+        return out
+
+    def get_item(self, item_id: int) -> dict | None:
+        """Full single item by id (cleaned text + key metadata)."""
+        try:
+            raw = self._get(f"/items/{item_id}")
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+        if not isinstance(raw, dict):
+            return None
+        return self._normalize_item(raw.get("data") or {})
+
+    def get_item_children(self, item_id: int, limit: int = 50) -> list[dict]:
+        """Decomposition children of an item."""
+        out = []
+        for raw in self._paginate(f"/items/{item_id}/children",
+                                  max_pages=10):
+            out.append(self._compact_item(raw))
+            if len(out) >= limit:
+                break
+        return out
+
+    def get_item_relationships(self, item_id: int, limit: int = 50) -> list[dict]:
+        """Relationships where ``item_id`` is the source (fromItem) or target.
+
+        Delegates to :meth:`list_project_relationships` after resolving the
+        item's project. Note: Jama has no server-side per-item relationship
+        filter, so this walks the whole project's relationships and filters
+        client-side — for large projects prefer
+        ``list_project_relationships`` directly, or keep ``limit`` small.
+        """
+        item = self.get_item(item_id)
+        if not item or not item.get("project_id"):
+            return []
+        return self.list_project_relationships(
+            item["project_id"], limit=limit, item_id=item_id)
+
+    def list_project_relationships(self, project_id: int, *, limit: int = 50,
+                                   item_id: int | None = None) -> list[dict]:
+        """List relationships for a project (cursor-paginated ``/relationships``).
+
+        Jama's ``/relationships`` endpoint requires a ``project`` filter and
+        uses ``lastId`` cursor pagination (not ``startAt``). When ``item_id``
+        is given, results are filtered client-side to those where the item is
+        the source (``fromItem``) or target (``toItem``).
+
+        Args:
+            project_id: Jama project id (required by the endpoint).
+            limit: max relationships to return.
+            item_id: optional item id to filter on (fromItem/toItem match).
+        """
+        cfg = settings.jama
+        url = f"{cfg.url}{cfg.api_prefix}/relationships"
+        out: list[dict] = []
+        last_id = 0
+        pages = 0
+        max_pages = 50  # safety cap on cursor walks
+        while pages < max_pages:
+            params = {"project": project_id, "lastId": last_id,
+                      "maxResults": cfg.page_size}
+            r = self._s.get(url, headers=self._headers(), params=params,
+                            timeout=cfg.request_timeout)
+            if r.status_code == 401:
+                with self._lock:
+                    self._token = None
+                r = self._s.get(url, headers=self._headers(), params=params,
+                                timeout=cfg.request_timeout)
+            r.raise_for_status()
+            data = r.json()
+            rows = data.get("data", []) or []
+            if not rows:
+                break
+            for raw in rows:
+                if item_id is not None and \
+                        raw.get("fromItem") != item_id and \
+                        raw.get("toItem") != item_id:
+                    continue
+                out.append(self._compact_relationship(raw))
+                if len(out) >= limit:
+                    return out
+            last_id = rows[-1].get("id", last_id)
+            page_info = data.get("meta", {}).get("pageInfo", {})
+            pages += 1
+            if int(page_info.get("resultCount", 0) or 0) == 0:
+                break
+            total = int(page_info.get("totalResults", 0) or 0)
+            if total and pages * cfg.page_size >= total:
+                break
+            if cfg.page_delay:
+                time.sleep(cfg.page_delay)
+        return out
+
+    def list_test_runs(self, *, project_id: int | None = None,
+                       test_cycle_id: int | None = None,
+                       limit: int = 50) -> list[dict]:
+        """Test runs for a project and/or test cycle."""
+        if project_id is None and test_cycle_id is None:
+            raise ValueError("list_test_runs requires project_id or test_cycle_id")
+        params: dict[str, Any] = {}
+        if project_id is not None:
+            params["project"] = project_id
+        if test_cycle_id is not None:
+            params["testCycle"] = test_cycle_id
+        out = []
+        for raw in self._paginate("/testruns", params, max_pages=20):
+            f = raw.get("fields", {}) or {}
+            out.append({
+                "id": raw.get("id"),
+                "name": f.get("name"),
+                "status": f.get("testRunStatus") or f.get("status"),
+                "test_cycle": raw.get("testCycle"),
+                "item": raw.get("item"),
+                "assigned_to": f.get("assignedTo"),
+                "modified_date": raw.get("modifiedDate"),
+            })
+            if len(out) >= limit:
+                break
+        return out
+
+    def get_item_comments(self, item_id: int, limit: int = 50) -> list[dict]:
+        """Comments threaded on an item (cleaned body).
+
+        Uses the ``/items/{id}/comments`` sub-resource (item-scoped), which is
+        the canonical Jama endpoint for item comments.
+        """
+        out = []
+        for raw in self._paginate(f"/items/{item_id}/comments", max_pages=10):
+            f = raw.get("fields", {}) or {}
+            out.append({
+                "id": raw.get("id"),
+                "body": clean_html(f.get("description", ""))[:1000],
+                "created_by": raw.get("createdBy"),
+                "created_date": raw.get("createdDate"),
+                "modified_date": raw.get("modifiedDate"),
+            })
+            if len(out) >= limit:
+                break
+        return out
+
+    def get_item_attachments(self, item_id: int, limit: int = 50) -> list[dict]:
+        """Attachment metadata for an item (no binary download).
+
+        Uses the ``/items/{id}/attachments`` sub-resource (item-scoped); the
+        flat ``/attachments`` endpoint does not accept an ``item`` filter.
+        """
+        out = []
+        for raw in self._paginate(f"/items/{item_id}/attachments", max_pages=10):
+            f = raw.get("fields", {}) or {}
+            out.append({
+                "id": raw.get("id"),
+                "name": f.get("name"),
+                "file_type": f.get("fileType"),
+                "file_size": f.get("fileSize"),
+                "mime_type": f.get("mimeType"),
+                "created_date": raw.get("createdDate"),
+                "modified_date": raw.get("modifiedDate"),
+            })
+            if len(out) >= limit:
+                break
+        return out
+
+    def list_releases(self, project_id: int, limit: int = 50) -> list[dict]:
+        """Releases / versions for a project."""
+        out = []
+        for raw in self._paginate("/releases", {"project": project_id}, max_pages=10):
+            f = raw.get("fields", {}) or {}
+            out.append({
+                "id": raw.get("id"),
+                "name": f.get("name"),
+                "release_date": f.get("releaseDate"),
+                "status": f.get("status"),
+                "description": clean_html(f.get("description", ""))[:300],
+                "modified_date": raw.get("modifiedDate"),
+            })
+            if len(out) >= limit:
+                break
+        return out
+
+    def list_item_types(self) -> list[dict]:
+        """All item types (id -> display) for the tenant."""
+        self.load_item_types()
+        return [{"id": k, "name": v} for k, v in sorted(self._item_types.items())]
+
+    # ----- compact shapers for list responses --------------------------- #
+    def _compact_item(self, raw: dict) -> dict:
+        f = raw.get("fields", {}) or {}
+        return {
+            "item_id": raw.get("id"),
+            "document_key": raw.get("documentKey"),
+            "global_id": raw.get("globalId"),
+            "item_type": raw.get("itemType"),
+            "item_type_name": self.item_type_name(raw.get("itemType")),
+            "name": (f.get("name") or "").strip(),
+            "status": f.get("status") or f.get("testCaseStatus") or "",
+            "modified_date": raw.get("modifiedDate"),
+        }
+
+    def _compact_relationship(self, raw: dict) -> dict:
+        f = raw.get("fields", {}) or {}
+        return {
+            "id": raw.get("id"),
+            "relationship_type": raw.get("relationshipType"),
+            "source_item": raw.get("fromItem"),
+            "target_item": raw.get("toItem"),
+            "suspect": raw.get("suspect"),
+            "name": (f.get("name") or "").strip(),
+            "modified_date": raw.get("modifiedDate"),
+        }
+
 
 def _safe_dumps(obj: Any) -> str:
     try:

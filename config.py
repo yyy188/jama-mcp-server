@@ -163,7 +163,12 @@ class ChunkSettings:
     separators: tuple = field(default=("\\n\\n", "\\n", ". ", "? ", "! ", " ", ""))
 
 
-@dataclass(frozen=True)
+# NOTE: ``Settings`` is intentionally NOT frozen so that ``reload_settings()``
+# can swap in fresh inner dataclasses after the config wizard writes a new
+# ``.env`` at runtime. Modules that did ``from config import settings`` hold a
+# reference to this same instance, so replacing its attributes propagates to
+# every caller without an import-time capture problem.
+@dataclass
 class Settings:
     jama: JamaSettings = field(default_factory=JamaSettings)
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
@@ -175,3 +180,120 @@ class Settings:
 
 
 settings = Settings()
+
+
+# --------------------------------------------------------------------------- #
+# Configuration validation, persistence and live reload
+# --------------------------------------------------------------------------- #
+# (var, human label, which feature needs it). Required vars block every tool
+# that talks to Jama or the embedding endpoint; optional ones only gate the
+# features that use them.
+REQUIRED_VARS = [
+    ("JAMA_URL", "Jama tenant URL", "jama"),
+    ("JAMA_CLIENT_ID", "Jama OAuth client id", "jama"),
+    ("JAMA_CLIENT_SECRET", "Jama OAuth client secret", "jama"),
+    ("EMBEDDING_BASE_URL", "Embedding endpoint URL", "embedding"),
+    ("EMBEDDING_API_KEY", "Embedding API key", "embedding"),
+]
+
+OPTIONAL_VARS = [
+    ("LLM_BASE_URL", "Chat LLM endpoint (Multi-Query expansion)", "llm"),
+    ("LLM_API_KEY", "Chat LLM API key", "llm"),
+]
+
+
+def validate_config() -> list[dict]:
+    """Return a list of issue dicts for missing/malformed config.
+
+    Each issue is ``{"field","severity","message","feature"}`` where severity
+    is ``"error"`` (blocks the feature) or ``"warn"`` (degraded mode). An empty
+    list means the configuration is complete.
+    """
+    issues: list[dict] = []
+    for name, label, feature in REQUIRED_VARS:
+        val = os.environ.get(name, "").strip()
+        if not val or val.startswith("your-"):
+            issues.append({
+                "field": name, "severity": "error",
+                "feature": feature,
+                "message": f"{label} is not set. Configure it via the setup "
+                           f"wizard (python setup_wizard.py) or the "
+                           f"configure_jama tool.",
+            })
+    # URL shape sanity (cheap, no network). Also flag placeholder hosts
+    # (your-tenant / example.com) so a never-configured .env is detected.
+    for name, host in (("JAMA_URL", "your-tenant"),
+                       ("EMBEDDING_BASE_URL", "your-embedding-endpoint")):
+        val = os.environ.get(name, "").strip()
+        if val and not val.startswith(("http://", "https://")):
+            issues.append({
+                "field": name, "severity": "error", "feature": "jama",
+                "message": f"{name} must start with http:// or https://",
+            })
+        if val and (host in val or "example.com" in val):
+            issues.append({
+                "field": name, "severity": "error",
+                "feature": "embedding" if name == "EMBEDDING_BASE_URL" else "jama",
+                "message": f"{name} is still a placeholder ({val}). Set the "
+                           f"real value via the setup wizard or configure_jama.",
+            })
+    return issues
+
+
+# All env keys the wizard knows how to write, in output order. Values come from
+# os.environ at write time; missing ones are emitted as blank lines so the file
+# stays a complete, self-documenting template.
+_ENV_KEYS = [
+    "JAMA_URL", "JAMA_CLIENT_ID", "JAMA_CLIENT_SECRET", "JAMA_API_PREFIX",
+    "JAMA_PAGE_SIZE", "JAMA_PAGE_DELAY",
+    "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
+    "EMBEDDING_DIMENSIONS", "EMBEDDING_KEY_HEADER",
+    "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL",
+    "RERANKER_MODEL", "RERANKER_DEVICE", "RERANKER_ALLOW_FALLBACK",
+    "JAMA_MCP_DB_PATH", "SQLITE_BUSY_TIMEOUT_MS",
+    "SYNC_ENABLED", "SYNC_INTERVAL_HOURS",
+    "CHUNK_SIZE", "CHUNK_OVERLAP",
+]
+
+
+def write_env_file(values: dict, path: str | None = None) -> str:
+    """Write a ``.env`` file from a ``{var: value}`` mapping.
+
+    Only the supplied keys are overridden; everything else is taken from the
+    current environment so a partial wizard run never clobbers existing
+    config. Returns the absolute path written.
+    """
+    target = Path(path) if path else PROJECT_ROOT / ".env"
+    merged = {k: os.environ.get(k, "") for k in _ENV_KEYS}
+    merged.update({k: ("" if v is None else str(v)) for k, v in values.items()})
+    lines = [
+        "# Jama MCP Server environment (managed by setup_wizard / configure_jama).",
+        "# Copy to .env and fill in. All values are read by config.py.",
+        "",
+    ]
+    for k in _ENV_KEYS:
+        lines.append(f"{k}={merged.get(k, '')}")
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(target)
+
+
+def reload_settings() -> None:
+    """Re-read ``.env`` (overriding the live environment) and rebuild settings.
+
+    Called after the config wizard / ``configure_jama`` writes a new ``.env``.
+    Because ``Settings`` is mutable and every module shares the same
+    ``settings`` instance, swapping the inner dataclasses here propagates to
+    already-imported callers (e.g. JamaClient reads ``settings.jama.url`` at
+    call time, not import time).
+    """
+    try:
+        load_dotenv(override=True)
+    except Exception:  # pragma: no cover
+        pass
+    settings.jama = JamaSettings()
+    settings.embedding = EmbeddingSettings()
+    settings.llm = LLMSettings()
+    settings.reranker = RerankerSettings()
+    settings.storage = StorageSettings()
+    settings.sync = SyncSettings()
+    settings.chunk = ChunkSettings()

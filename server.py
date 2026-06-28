@@ -24,12 +24,13 @@ from concurrent.futures import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 from mcp.server.fastmcp import FastMCP
 
-from config import settings
+from config import reload_settings, settings, write_env_file
 from db_setup import (count_chunks, create_job, get_connection, get_job,
                       get_project, init_db, list_initialized_projects,
                       update_job, upsert_item, upsert_project,
                       replace_chunks, write_txn)
 from jama_client import JamaClient, utcnow_iso
+from preflight import preflight
 from rag_pipeline import RAGPipeline, chunk_item
 
 logging.basicConfig(
@@ -75,6 +76,43 @@ def rag() -> RAGPipeline:
             if _rag is None:
                 _rag = RAGPipeline()
     return _rag
+
+
+def reset_singletons() -> None:
+    """Drop cached Jama/RAG/DB singletons so they rebuild with fresh config.
+
+    Called after ``configure_jama`` rewrites ``.env`` and reloads settings:
+    the old singletons were built from the previous config, so the next tool
+    call must reconstruct them against the new values.
+    """
+    global _db_conn, _jama, _rag
+    with _init_lock:
+        _db_conn = None
+        _jama = None
+        _rag = None
+
+
+# --------------------------------------------------------------------------- #
+# Pre-flight guard: every tool gates on this before doing real work.
+# --------------------------------------------------------------------------- #
+def _ensure_ready(require: set[str]) -> dict | None:
+    """Return an error dict if the server isn't configured for ``require``.
+
+    ``require`` is a subset of ``{"jama","embedding","llm"}`` describing which
+    backend features the calling tool needs. The check is offline and fast
+    (packages + config + storage), so it adds negligible latency per call.
+    Returns ``None`` when ready, letting the tool proceed.
+    """
+    report = preflight(require=require)
+    if report["blocking"]:
+        return {
+            "error": "Server is not ready: configuration or dependencies are "
+                     "incomplete.",
+            "issues": report["issues"],
+            "hint": report["hint"] or "Call validate_setup for a full report, "
+                    "or configure_jama with the missing values.",
+        }
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -200,6 +238,9 @@ def init_jama_project(project_id: str) -> dict:
     Returns:
         {"job_id": "...", "project_id": ..., "status": "RUNNING"}
     """
+    not_ready = _ensure_ready({"jama", "embedding"})
+    if not_ready:
+        return not_ready
     try:
         pid = int(project_id)
     except (TypeError, ValueError):
@@ -222,6 +263,9 @@ def get_sync_progress(job_id: str) -> dict:
          "message","started_at","finished_at"}
         status is one of PENDING | RUNNING | DONE | ERROR.
     """
+    not_ready = _ensure_ready(set())
+    if not_ready:
+        return not_ready
     conn = db()
     row = get_job(conn, job_id)
     if row is None:
@@ -268,6 +312,9 @@ def search_jama_semantics(project_id: str, query: str,
         {"project_id","query","results":[{document_key,name,item_type_name,
         section,modified_date,text,score,strategy}, ...]}
     """
+    not_ready = _ensure_ready({"jama", "embedding"})
+    if not_ready:
+        return not_ready
     try:
         pid = int(project_id)
     except (TypeError, ValueError):
@@ -341,6 +388,9 @@ def query_jama_native_metadata(project_id: str, document_key: str = None,
         {"project_id","count","results":[{document_key,name,item_type_name,
         status,modified_date,description}, ...]}
     """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
     try:
         pid = int(project_id)
     except (TypeError, ValueError):
@@ -353,6 +403,424 @@ def query_jama_native_metadata(project_id: str, document_key: str = None,
         log.error("native query failed: %s\n%s", exc, traceback.format_exc())
         return {"error": f"Jama API query failed: {exc}"}
     return {"project_id": pid, "count": len(rows), "results": rows}
+
+
+# --------------------------------------------------------------------------- #
+# Read-only Jama browse tools (extend the native query surface)
+# --------------------------------------------------------------------------- #
+# Each gate on {"jama"} only (no embedding/index needed). They are thin
+# wrappers over JamaClient methods that reuse the OAuth + pagination machinery.
+
+@mcp.tool()
+def list_jama_projects() -> dict:
+    """List all Jama projects visible to the OAuth client.
+
+    Returns:
+        {"count","results":[{id,project_key,name,status,description}, ...]}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    try:
+        rows = jama().list_projects()
+    except Exception as exc:
+        log.error("list_jama_projects failed: %s\n%s", exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"count": len(rows), "results": rows}
+
+
+@mcp.tool()
+def get_jama_item(item_id: str) -> dict:
+    """Fetch a single Jama item by id (full metadata + cleaned text).
+
+    Args:
+        item_id: numeric string Jama item id.
+
+    Returns:
+        {"item":{item_id,document_key,item_type_name,name,status,
+        description,test_steps,modified_date,...}}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    try:
+        iid = int(item_id)
+    except (TypeError, ValueError):
+        return {"error": "item_id must be a numeric string"}
+    try:
+        item = jama().get_item(iid)
+    except Exception as exc:
+        log.error("get_jama_item failed: %s\n%s", exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    if item is None:
+        return {"error": f"Item {iid} not found"}
+    return {"item": item}
+
+
+@mcp.tool()
+def get_jama_item_relationships(item_id: str, limit: int = 50) -> dict:
+    """List relationships (source/target) for an item.
+
+    Args:
+        item_id: numeric string Jama item id.
+        limit: max relationships to return (default 50).
+
+    Returns:
+        {"item_id","count","results":[{id,relationship_type,source_item,
+        target_item,name,modified_date}, ...]}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    try:
+        iid = int(item_id)
+    except (TypeError, ValueError):
+        return {"error": "item_id must be a numeric string"}
+    try:
+        rows = jama().get_item_relationships(iid, limit=limit)
+    except Exception as exc:
+        log.error("get_jama_item_relationships failed: %s\n%s",
+                  exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"item_id": iid, "count": len(rows), "results": rows}
+
+
+@mcp.tool()
+def get_jama_item_children(item_id: str, limit: int = 50) -> dict:
+    """List decomposition children of an item.
+
+    Args:
+        item_id: numeric string Jama item id.
+        limit: max children to return (default 50).
+
+    Returns:
+        {"item_id","count","results":[{item_id,document_key,item_type_name,
+        name,status,modified_date}, ...]}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    try:
+        iid = int(item_id)
+    except (TypeError, ValueError):
+        return {"error": "item_id must be a numeric string"}
+    try:
+        rows = jama().get_item_children(iid, limit=limit)
+    except Exception as exc:
+        log.error("get_jama_item_children failed: %s\n%s",
+                  exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"item_id": iid, "count": len(rows), "results": rows}
+
+
+@mcp.tool()
+def list_jama_project_relationships(project_id: str, item_id: str = None,
+                                    limit: int = 50) -> dict:
+    """List relationships for a project (cursor-paginated Jama endpoint).
+
+    Jama's ``/relationships`` endpoint requires a ``project`` filter and uses
+    ``lastId`` cursor pagination. Optionally filter to relationships involving
+    a specific item (client-side on fromItem/toItem).
+
+    Args:
+        project_id: numeric string Jama project id.
+        item_id: optional numeric string item id to filter on.
+        limit: max relationships to return (default 50).
+
+    Returns:
+        {"project_id","count","results":[{id,relationship_type,source_item,
+        target_item,suspect,name,modified_date}, ...]}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    try:
+        pid = int(project_id)
+    except (TypeError, ValueError):
+        return {"error": "project_id must be a numeric string"}
+    iid = None
+    if item_id is not None and str(item_id).strip():
+        try:
+            iid = int(item_id)
+        except (TypeError, ValueError):
+            return {"error": "item_id must be a numeric string"}
+    try:
+        rows = jama().list_project_relationships(
+            pid, limit=limit, item_id=iid)
+    except Exception as exc:
+        log.error("list_jama_project_relationships failed: %s\n%s",
+                  exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"project_id": pid, "count": len(rows), "results": rows}
+
+
+@mcp.tool()
+def get_jama_item_comments(item_id: str, limit: int = 50) -> dict:
+    """List comments threaded on an item.
+
+    Args:
+        item_id: numeric string Jama item id.
+        limit: max comments to return (default 50).
+
+    Returns:
+        {"item_id","count","results":[{id,body,created_by,created_date,
+        modified_date}, ...]}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    try:
+        iid = int(item_id)
+    except (TypeError, ValueError):
+        return {"error": "item_id must be a numeric string"}
+    try:
+        rows = jama().get_item_comments(iid, limit=limit)
+    except Exception as exc:
+        log.error("get_jama_item_comments failed: %s\n%s",
+                  exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"item_id": iid, "count": len(rows), "results": rows}
+
+
+@mcp.tool()
+def get_jama_item_attachments(item_id: str, limit: int = 50) -> dict:
+    """List attachment metadata for an item (no binary download).
+
+    Args:
+        item_id: numeric string Jama item id.
+        limit: max attachments to return (default 50).
+
+    Returns:
+        {"item_id","count","results":[{id,name,file_type,file_size,
+        mime_type,created_date,modified_date}, ...]}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    try:
+        iid = int(item_id)
+    except (TypeError, ValueError):
+        return {"error": "item_id must be a numeric string"}
+    try:
+        rows = jama().get_item_attachments(iid, limit=limit)
+    except Exception as exc:
+        log.error("get_jama_item_attachments failed: %s\n%s",
+                  exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"item_id": iid, "count": len(rows), "results": rows}
+
+
+@mcp.tool()
+def list_jama_releases(project_id: str, limit: int = 50) -> dict:
+    """List releases / versions for a project.
+
+    Args:
+        project_id: numeric string Jama project id.
+        limit: max releases to return (default 50).
+
+    Returns:
+        {"project_id","count","results":[{id,name,release_date,status,
+        description,modified_date}, ...]}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    try:
+        pid = int(project_id)
+    except (TypeError, ValueError):
+        return {"error": "project_id must be a numeric string"}
+    try:
+        rows = jama().list_releases(pid, limit=limit)
+    except Exception as exc:
+        log.error("list_jama_releases failed: %s\n%s",
+                  exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"project_id": pid, "count": len(rows), "results": rows}
+
+
+@mcp.tool()
+def list_jama_test_runs(project_id: str = None,
+                        test_cycle_id: str = None,
+                        limit: int = 50) -> dict:
+    """List test runs for a project and/or test cycle.
+
+    At least one of ``project_id`` / ``test_cycle_id`` must be provided.
+
+    Args:
+        project_id: optional numeric string Jama project id.
+        test_cycle_id: optional numeric string Jama test cycle id.
+        limit: max test runs to return (default 50).
+
+    Returns:
+        {"count","results":[{id,name,status,test_cycle,item,assigned_to,
+        modified_date}, ...]}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    pid = None
+    tcid = None
+    try:
+        if project_id is not None and str(project_id).strip():
+            pid = int(project_id)
+        if test_cycle_id is not None and str(test_cycle_id).strip():
+            tcid = int(test_cycle_id)
+    except (TypeError, ValueError):
+        return {"error": "project_id/test_cycle_id must be numeric strings"}
+    if pid is None and tcid is None:
+        return {"error": "Provide project_id and/or test_cycle_id"}
+    try:
+        rows = jama().list_test_runs(project_id=pid, test_cycle_id=tcid,
+                                     limit=limit)
+    except Exception as exc:
+        log.error("list_jama_test_runs failed: %s\n%s",
+                  exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"count": len(rows), "results": rows}
+
+
+@mcp.tool()
+def list_jama_item_types() -> dict:
+    """List all Jama item types (id -> display name) for the tenant.
+
+    Returns:
+        {"count","results":[{id,name}, ...]}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    try:
+        rows = jama().list_item_types()
+    except Exception as exc:
+        log.error("list_jama_item_types failed: %s\n%s",
+                  exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"count": len(rows), "results": rows}
+
+
+@mcp.tool()
+def query_jama_endpoint(path: str, params: str = None,
+                        all_pages: bool = False) -> dict:
+    """Power-user escape hatch: GET any Jama REST endpoint (read-only).
+
+    ``path`` is appended to ``{JAMA_URL}{API_PREFIX}`` (e.g. ``"/projects"``).
+    Only GET is ever issued; the client is read-only by design.
+
+    Args:
+        path: REST path beginning with '/', e.g. "/items/12345".
+        params: optional 'k1=v1&k2=v2' query string.
+        all_pages: if True, walk all pages and return a flat list of ``data``;
+                   if False (default), return only the first page.
+
+    Returns:
+        {"path","data": <first-page data or flat list>}
+    """
+    not_ready = _ensure_ready({"jama"})
+    if not_ready:
+        return not_ready
+    if not path or not path.startswith("/"):
+        return {"error": "path must start with '/' (e.g. '/projects')"}
+    parsed: dict | None = None
+    if params:
+        from urllib.parse import parse_qs
+        parsed = {k: v[0] if len(v) == 1 else v
+                  for k, v in parse_qs(params).items()}
+    try:
+        data = jama().get_raw(path, params=parsed,
+                              max_pages=None if all_pages else 1)
+    except Exception as exc:
+        log.error("query_jama_endpoint failed: %s\n%s",
+                  exc, traceback.format_exc())
+        return {"error": f"Jama API query failed: {exc}"}
+    return {"path": path, "data": data}
+
+
+# --------------------------------------------------------------------------- #
+# Configuration tools: validate_setup + configure_jama
+# --------------------------------------------------------------------------- #
+@mcp.tool()
+def validate_setup(live: bool = False) -> dict:
+    """Validate all dependencies, configuration and storage.
+
+    Runs the offline pre-flight (packages + env vars + SQLite). When
+    ``live=True`` it also probes the Jama OAuth token and the embedding
+    endpoint with a real request, so credentials can be verified without
+    running a full project init.
+
+    Args:
+        live: if True, perform live connectivity probes against Jama and the
+              embedding endpoint (slower; uses one Jama + one embedding call).
+
+    Returns:
+        {"blocking","issues":[...],"dependencies","config_issues","storage",
+         "live": {"jama","embedding"} | null, "hint"}
+    """
+    report = preflight(require={"jama", "embedding"})
+    out: dict = {
+        "blocking": report["blocking"],
+        "issues": report["issues"],
+        "dependencies": report["dependencies"],
+        "config_issues": report["config_issues"],
+        "storage": report["storage"],
+        "live": None,
+        "hint": report["hint"],
+    }
+    if live and not report["blocking"]:
+        out["live"] = _live_probe()
+    return out
+
+
+def _live_probe() -> dict:
+    """Live (network) checks for Jama auth + embedding endpoint."""
+    result: dict = {"jama": None, "embedding": None}
+    try:
+        client = jama()
+        client.preflight_speed_check()
+        projects = list(client.list_projects())
+        result["jama"] = {"ok": True, "project_count": len(projects)}
+    except Exception as exc:
+        result["jama"] = {"ok": False, "error": str(exc)[:300]}
+    try:
+        from rag_pipeline import EmbeddingClient
+        vec = EmbeddingClient().embed_one("jama mcp validate")
+        result["embedding"] = {"ok": True, "dimensions": len(vec)}
+    except Exception as exc:
+        result["embedding"] = {"ok": False, "error": str(exc)[:300]}
+    return result
+
+
+@mcp.tool()
+def configure_jama(values: dict) -> dict:
+    """Apply configuration values at runtime and persist them to .env.
+
+    Accepts a mapping of env-var names to values (e.g.
+    ``{"JAMA_URL":"...","JAMA_CLIENT_SECRET":"..."}`). Writes a complete
+    ``.env`` (merging with existing values), reloads settings in-process, and
+    resets the Jama/RAG/DB singletons so subsequent calls use the new config.
+    Secrets are written to ``.env`` on disk only; they are never echoed back.
+
+    Args:
+        values: dict of {ENV_VAR: value}. Recognized keys: JAMA_URL,
+                JAMA_CLIENT_ID, JAMA_CLIENT_SECRET, EMBEDDING_BASE_URL,
+                EMBEDDING_API_KEY, LLM_BASE_URL, LLM_API_KEY, JAMA_MCP_DB_PATH,
+                and any other key in the .env template.
+
+    Returns:
+        {"ok": true, "written": <abs .env path>, "applied_keys": [...]}
+        or {"error": ...}
+    """
+    if not isinstance(values, dict) or not values:
+        return {"error": "values must be a non-empty dict {ENV_VAR: value}"}
+    try:
+        path = write_env_file(values)
+    except Exception as exc:
+        log.error("configure_jama write failed: %s", exc)
+        return {"error": f"Failed to write .env: {exc}"}
+    reload_settings()
+    reset_singletons()
+    log.info("Configuration applied; .env rewritten with keys: %s",
+             list(values.keys()))
+    return {"ok": True, "written": path, "applied_keys": list(values.keys())}
 
 
 # --------------------------------------------------------------------------- #

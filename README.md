@@ -72,13 +72,22 @@ their old chunks replaced atomically.
 # 1. Install (uses Aliyun mirror; GitHub-only deps fall back to PyPI)
 pip install -r requirements.txt
 
-# 2. Configure
-cp .env.example .env
-# edit .env with your Jama + embedding credentials
+# 2. Configure (interactive wizard writes .env, then validates deps + config,
+#    and optionally probes Jama/embedding connectivity with --self-test)
+python setup_wizard.py --self-test
 
 # 3. Run (stdio transport for an MCP client)
 python server.py
 ```
+
+### First-run configuration guard
+
+Every MCP tool runs an offline **pre-flight check** before doing any work:
+Python dependencies, required env vars (JAMA_URL / JAMA_CLIENT_ID /
+JAMA_CLIENT_SECRET / EMBEDDING_BASE_URL / EMBEDDING_API_KEY) and the SQLite
+store. If anything is missing the tool returns a clear error dict with a
+`hint` instead of failing midway through a Jama API call. Configure via the
+wizard, or call the `configure_jama` / `validate_setup` tools at runtime.
 
 ### MCP client config (Claude Desktop example)
 
@@ -120,12 +129,39 @@ python server.py
 | File | Purpose |
 |------|---------|
 | `requirements.txt` | deps + Aliyun mirror config |
-| `config.py` | env-driven settings (dataclasses) |
+| `config.py` | env-driven settings (dataclasses) + validation/persistence/reload |
 | `db_setup.py` | SQLite schema, FTS5 + sqlite-vec loading, CRUD |
-| `jama_client.py` | OAuth, paginated fetch, HTML cleaning, native query |
+| `jama_client.py` | OAuth, paginated fetch, HTML cleaning, native query, browse API |
 | `rag_pipeline.py` | chunking, embeddings, Multi-Query, hybrid recall, RRF, rerank |
-| `server.py` | MCP tools, async jobs, APScheduler incremental sync |
+| `server.py` | MCP tools, async jobs, APScheduler incremental sync, pre-flight guards |
+| `preflight.py` | offline dependency + config + storage validation |
+| `setup_wizard.py` | interactive configuration wizard (`python setup_wizard.py`) |
+| `selftest.py` | end-to-end self-test suite (`python selftest.py`) |
 | `.env.example` | template for environment configuration |
+
+## Tools
+
+**Configuration & validation**
+- `validate_setup(live=False)` — offline pre-flight (+ optional live Jama/embedding probe).
+- `configure_jama(values)` — apply config at runtime, persist to `.env`, reload.
+
+**Jama browse (read-only, gated by pre-flight)**
+- `list_jama_projects()` — all visible projects.
+- `get_jama_item(item_id)` — full single item (cleaned text).
+- `get_jama_item_children(item_id)` — decomposition children.
+- `get_jama_item_relationships(item_id)` / `list_jama_project_relationships(project_id, item_id?)` — relationships (cursor-paginated `/relationships`).
+- `get_jama_item_comments(item_id)` — item comments (cleaned body).
+- `get_jama_item_attachments(item_id)` — attachment metadata (no binary).
+- `list_jama_releases(project_id)` — project releases/versions.
+- `list_jama_test_runs(project_id?, test_cycle_id?)` — test runs.
+- `list_jama_item_types()` — tenant item types (id → name).
+- `query_jama_endpoint(path, params?, all_pages?)` — generic read-only GET escape hatch.
+
+**RAG / retrieval**
+- `init_jama_project(project_id)` — async background init (returns `job_id`).
+- `get_sync_progress(job_id)` — poll init/sync progress.
+- `search_jama_semantics(project_id, query, ...)` — Multi-Query + hybrid + RRF + Qwen3 rerank.
+- `query_jama_native_metadata(project_id, ...)` — exact-match metadata via `/abstractitems`.
 
 ## Verified
 
