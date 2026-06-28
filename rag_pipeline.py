@@ -466,6 +466,24 @@ class RAGPipeline:
     def embed_chunks(self, chunks: list[dict]) -> list[list[float]]:
         return self.embedder.embed_texts([c["text"] for c in chunks])
 
+    def embed_many(self, chunks: list[dict]) -> list[list[float]]:
+        """Embed a flat list of chunks, packing them into full API batches.
+
+        Unlike calling ``embed_chunks`` once per item (which underfills each
+        HTTP request when items have only 1-3 chunks), this batches across
+        items: it walks the whole chunk list in ``batch_size`` slices and
+        issues one embedding request per slice. For a project with ~1.4
+        chunks/item and ``batch_size=64`` this cuts the number of HTTP round
+        trips ~45x, turning minutes of serial network wait into seconds.
+
+        Embeddings are returned position-aligned with the input ``chunks``
+        so callers can ``zip(chunks, embeddings)`` directly.
+        """
+        if not chunks:
+            return []
+        texts = [c["text"] for c in chunks]
+        return self.embedder.embed_texts(texts)
+
     # ----- retrieval ----------------------------------------------------- #
     def search(self, project_id: int, query: str, *,
                item_type: int | None = None,

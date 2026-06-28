@@ -296,6 +296,23 @@ class JamaClient:
                 return None
             raise
 
+    def count_project_items(self, project_id: int) -> int:
+        """Cheap total item count for a project (single 1-result probe page).
+
+        Used to set a job's ``total`` up-front so progress is visible during
+        the streaming fetch+index, without waiting for the full pagination to
+        complete. Reads ``meta.pageInfo.totalResults`` from a maxResults=1
+        request; returns 0 if the probe fails (callers fall back to unknown).
+        """
+        try:
+            data = self._get("/items", params={"project": project_id,
+                                               "startAt": 0, "maxResults": 1})
+            return int(data.get("meta", {}).get("pageInfo", {})
+                       .get("totalResults", 0) or 0)
+        except Exception as exc:
+            log.warning("count_project_items(%s) failed: %s", project_id, exc)
+            return 0
+
     def iter_project_items(self, project_id: int,
                            modified_after: str | None = None,
                            max_items: int | None = None) -> Iterator[dict]:

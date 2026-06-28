@@ -199,16 +199,86 @@ def _sync_project(project_id: int, *, job_id: str | None,
         upsert_project(conn, project_id, status="ERROR", error=msg)
         return
 
-    # First pass: collect items to process (for progress + batching).
-    items = list(client.iter_project_items(
-        project_id, modified_after=last_sync,
-        max_items=settings.sync.max_items_per_run if incremental else None))
-    total = len(items)
+    # Probe the total item count cheaply (one maxResults=1 page) so the job's
+    # `total` is known up-front and progress is visible from the very first
+    # item, instead of only after the full pagination finishes. Falls back to
+    # 0 (unknown) if the probe fails — progress then reports done count only.
+    total = client.count_project_items(project_id)
     if job_id:
         update_job(conn, job_id, total=total, done=0,
-                   message=f"Indexing {total} items")
+                   message=f"Streaming fetch + index of {total or 'unknown'} items")
 
-    if total == 0:
+    # Streaming fetch + batched index. We walk the item generator directly
+    # (no list() materialization), chunk each item, and accumulate chunks
+    # across items into embedding-sized batches. This does two things at once:
+    #   1. progress updates fire per-item as items stream in (issue #1);
+    #   2. embedding HTTP requests are packed to batch_size across items
+    #      instead of one underfilled request per item (issue #2).
+    pipeline = rag()
+    max_items = settings.sync.max_items_per_run if incremental else None
+    batch_size = settings.embedding.batch_size
+    pending: list[tuple[dict, list[dict]]] = []  # (item, chunks) awaiting embed
+    pending_chunk_count = 0
+    done = 0
+    chunk_total = 0
+
+    def _flush_pending() -> None:
+        """Embed + store all accumulated chunks in packed batches."""
+        nonlocal chunk_total
+        if not pending:
+            return
+        flat: list[dict] = []
+        owners: list[tuple[dict, list[dict]]] = []  # (item, its chunks) aligned
+        for item, chunks in pending:
+            owners.append((item, chunks))
+            flat.extend(chunks)
+        # embed_many packs flat into batch_size HTTP requests across items.
+        embeddings = pipeline.embed_many(flat)
+        # Write each item's metadata + its chunks in one go.
+        idx = 0
+        for item, chunks in owners:
+            n = len(chunks)
+            item_embs = embeddings[idx:idx + n]
+            idx += n
+            try:
+                with write_txn(conn):
+                    upsert_item(conn, item)
+                replace_chunks(conn, item["item_id"], chunks, item_embs)
+                chunk_total += n
+            except Exception as exc:
+                log.warning("Failed to index item %s: %s",
+                            item.get("item_id"), exc)
+        pending.clear()
+        pending_chunk_count = 0
+
+    for item in client.iter_project_items(
+            project_id, modified_after=last_sync, max_items=max_items):
+        try:
+            chunks = chunk_item(item)
+            if chunks:
+                pending.append((item, chunks))
+                pending_chunk_count += len(chunks)
+            else:
+                # No text: persist metadata + clear any stale chunks.
+                with write_txn(conn):
+                    upsert_item(conn, item)
+                replace_chunks(conn, item["item_id"], [], [])
+        except Exception as exc:
+            log.warning("Failed to chunk item %s: %s", item.get("item_id"), exc)
+        done += 1
+        # Flush when the pending chunk pool reaches an embedding batch. This
+        # keeps memory bounded and packs each HTTP request to capacity.
+        if pending_chunk_count >= batch_size:
+            _flush_pending()
+        if job_id:
+            pct = round(done / total, 4) if total else 0.0
+            update_job(conn, job_id, done=done, progress=pct,
+                       message=f"Indexed {done}/{total or '?'} items")
+
+    # Flush any trailing partial batch.
+    _flush_pending()
+
+    if done == 0:
         if job_id:
             update_job(conn, job_id, status="DONE", progress=1.0,
                        done=0, message="No new/modified items")
@@ -216,41 +286,16 @@ def _sync_project(project_id: int, *, job_id: str | None,
                        last_sync_time=utcnow_iso())
         return
 
-    pipeline = rag()
-    done = 0
-    chunk_total = 0
-    for item in items:
-        try:
-            # Persist item metadata.
-            with write_txn(conn):
-                upsert_item(conn, item)
-            # Chunk + embed + index.
-            chunks = chunk_item(item)
-            if chunks:
-                embeddings = pipeline.embed_chunks(chunks)
-                replace_chunks(conn, item["item_id"], chunks, embeddings)
-                chunk_total += len(chunks)
-            else:
-                # Remove stale chunks for items that no longer have text.
-                replace_chunks(conn, item["item_id"], [], [])
-        except Exception as exc:
-            log.warning("Failed to index item %s: %s", item.get("item_id"), exc)
-        done += 1
-        if job_id and total:
-            update_job(conn, job_id, done=done,
-                       progress=round(done / total, 4),
-                       message=f"Indexed {done}/{total} items")
-
     final_chunk_count = count_chunks(conn, project_id)
     upsert_project(conn, project_id, name=proj_name, status="READY",
                    last_sync_time=utcnow_iso(),
-                   item_count=total, chunk_count=final_chunk_count)
+                   item_count=done, chunk_count=final_chunk_count)
     if job_id:
         update_job(conn, job_id, status="DONE", progress=1.0, done=done,
-                   message=f"Done: {total} items, {chunk_total} chunks "
+                   message=f"Done: {done} items, {chunk_total} chunks "
                            f"indexed this run")
     log.info("Sync complete for project %s: %s items, %s chunks",
-             project_id, total, chunk_total)
+             project_id, done, chunk_total)
 
 
 def _run_job(project_id: int, job_id: str, incremental: bool) -> None:
