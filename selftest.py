@@ -222,18 +222,27 @@ def test_preflight_guard_blocks() -> None:
     section("10. Pre-flight guard blocks a misconfigured server")
     # Simulate missing config. reload_settings() re-reads .env, so we must
     # temporarily move .env aside to truly simulate an unconfigured server.
+    #
+    # We only touch the 5 config vars we care about (save/restore their values
+    # individually) instead of snapshotting the whole os.environ. On Windows,
+    # os.environ.clear()+update(full snapshot) raises
+    # "ValueError: environment variable longer than 32767" because some real
+    # vars (PATH, proxy/IDE injections) exceed the Win32 SetEnvironmentVariableW
+    # 32767-char limit — and that crash happens in the cleanup phase *after* all
+    # tests passed, turning a green run into a non-zero exit. Avoid it entirely
+    # by never clearing or bulk-restoring the environment.
     from config import PROJECT_ROOT
     env_path = PROJECT_ROOT / ".env"
     bak_path = PROJECT_ROOT / ".env.selftest_bak"
+    cfg_vars = ("JAMA_URL", "JAMA_CLIENT_ID", "JAMA_CLIENT_SECRET",
+                "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY")
+    saved = {k: os.environ.get(k) for k in cfg_vars}
     moved = False
-    saved_env = dict(os.environ)
     try:
         if env_path.exists():
             env_path.rename(bak_path)
             moved = True
-        # Clear the relevant vars from the live env too.
-        for k in ("JAMA_URL", "JAMA_CLIENT_ID", "JAMA_CLIENT_SECRET",
-                  "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY"):
+        for k in cfg_vars:
             os.environ.pop(k, None)
         import config
         config.reload_settings()
@@ -246,11 +255,14 @@ def test_preflight_guard_blocks() -> None:
             _fail("guard blocks misconfig",
                   f"expected blocking=True; issues={report['issues']}")
     finally:
-        # Restore .env and the live environment, then reload for downstream tests.
+        # Restore .env and only the 5 config vars we touched, then reload.
         if moved and bak_path.exists():
             bak_path.rename(env_path)
-        os.environ.clear()
-        os.environ.update(saved_env)
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         import config
         config.reload_settings()
 
