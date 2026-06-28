@@ -76,13 +76,24 @@ def _collect() -> dict:
                                         os.environ.get("JAMA_CLIENT_SECRET", ""),
                                         secret=True)
 
-    print("\n--- Embedding endpoint (required for semantic search) ---")
-    values["EMBEDDING_BASE_URL"] = _ask("Embedding endpoint URL",
-                                        os.environ.get("EMBEDDING_BASE_URL", ""),
-                                        validator=_url_validator("EMBEDDING_BASE_URL"))
-    values["EMBEDDING_API_KEY"] = _ask("Embedding API key",
-                                       os.environ.get("EMBEDDING_API_KEY", ""),
-                                       secret=True)
+    print("\n--- Embedding (local CPU model by default) ---")
+    print("  Default: local bge-small-en-v1.5 (runs on CPU, no API key needed).")
+    use_azure = _ask("Use an Azure/OpenAI embedding endpoint instead? (y/N)",
+                     "N").strip().lower() in ("y", "yes")
+    if use_azure:
+        values["EMBEDDING_PROVIDER"] = "azure"
+        values["EMBEDDING_BASE_URL"] = _ask(
+            "Embedding endpoint URL",
+            os.environ.get("EMBEDDING_BASE_URL", ""),
+            validator=_url_validator("EMBEDDING_BASE_URL"))
+        values["EMBEDDING_API_KEY"] = _ask(
+            "Embedding API key",
+            os.environ.get("EMBEDDING_API_KEY", ""),
+            secret=True)
+    else:
+        # Local provider: no credentials needed. Explicitly set it so a stale
+        # EMBEDDING_PROVIDER=azure in the old .env doesn't persist.
+        values["EMBEDDING_PROVIDER"] = "local"
 
     print("\n--- Storage / sync (defaults are fine for most setups) ---")
     values["JAMA_MCP_DB_PATH"] = _ask("SQLite DB path",
@@ -96,9 +107,14 @@ def _collect() -> dict:
 # Live connectivity self-test
 # --------------------------------------------------------------------------- #
 def _live_selftest() -> dict:
-    """Probe Jama auth + embedding endpoint with the configured credentials."""
+    """Probe Jama auth + embedding with the configured credentials.
+
+    Uses the embedding backend selected by ``EMBEDDING_PROVIDER`` (local CPU
+    by default, azure if configured), so the probe matches what the server
+    actually uses at runtime.
+    """
     from jama_client import JamaClient
-    from rag_pipeline import EmbeddingClient
+    from rag_pipeline import LocalEmbeddingClient, EmbeddingClient
     report = {"jama": None, "embedding": None}
 
     # Jama: list projects (lightweight) to confirm OAuth + reachability.
@@ -112,11 +128,16 @@ def _live_selftest() -> dict:
     except Exception as exc:
         report["jama"] = {"ok": False, "error": str(exc)[:300]}
 
-    # Embedding: embed a probe string.
+    # Embedding: embed a probe string using the active provider.
     try:
-        emb = EmbeddingClient()
+        if settings.embedding.provider == "local":
+            emb = LocalEmbeddingClient()
+        else:
+            emb = EmbeddingClient()
         vec = emb.embed_one("jama mcp self test")
-        report["embedding"] = {"ok": True, "dimensions": len(vec)}
+        report["embedding"] = {"ok": True,
+                               "provider": settings.embedding.provider,
+                               "dimensions": len(vec)}
     except Exception as exc:
         report["embedding"] = {"ok": False, "error": str(exc)[:300]}
     return report
