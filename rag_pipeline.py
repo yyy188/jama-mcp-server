@@ -410,6 +410,24 @@ class LocalEmbeddingClient:
             log.error("Local embedding model unavailable: %s", exc)
             return False
 
+    def ensure_downloaded(self) -> None:
+        """Pre-download the embedding model without loading it.
+
+        Called at the very start of project sync so the (64 MB) download
+        happens before any indexing work, alongside the reranker weights. If
+        the model is already cached this is a fast no-op. A failure here is
+        non-fatal: the actual load (and error) is deferred to first embed.
+        """
+        if self._model is not None or self._load_error is not None:
+            return
+        if self._model_present():
+            return
+        try:
+            self._download_model()
+        except Exception as exc:
+            log.warning("Embedding model pre-download failed (%s); "
+                        "will retry on first embed.", exc)
+
     # ----- embed API (mirrors EmbeddingClient) ------------------------- #
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch of document texts (no query prefix)."""
@@ -563,6 +581,24 @@ class QwenReranker:
         self._tokenizer = None
         self._model = None
         self._load_error: str | None = None
+
+    def ensure_downloaded(self) -> None:
+        """Pre-download reranker weights without loading the model.
+
+        Called during project sync so the (1.2 GB) download happens up front,
+        alongside the embedding model — not deferred to the first search
+        (where a download failure would surprise the user mid-query). If the
+        weights are already cached this is a no-op. A failure here is
+        non-fatal: the reranker stays unloaded and search degrades to RRF.
+        """
+        if self._model is not None or self._load_error is not None:
+            return
+        try:
+            self._ensure_weights_downloaded()
+            log.info("Qwen3-Reranker weights ready (pre-downloaded during sync).")
+        except Exception as exc:
+            log.warning("Qwen3-Reranker pre-download failed (%s); "
+                        "will retry on first search or fall back to RRF.", exc)
 
     def _load(self) -> bool:
         if self._model is not None:

@@ -208,13 +208,29 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
         last_sync = proj["last_sync_time"] if proj else None
     upsert_project(conn, project_id, status="INITIALIZING")
 
+    # ---- Step 1: pre-download ML models BEFORE any indexing work. ----
+    # Both the embedding model (64 MB) and the reranker (1.2 GB) are fetched
+    # first so that (a) a download failure surfaces immediately with a clear
+    # message instead of mid-sync, and (b) the first search after sync doesn't
+    # stall on a 1.2 GB download. Non-fatal: failures just defer to lazy load
+    # (embedding) or RRF fallback (reranker) — sync still proceeds.
     if job_id:
         update_job(conn, job_id, status="RUNNING", progress=0.0,
-                   message="Pre-flight network speed test")
+                   message="Downloading embedding + reranker models")
+    pipeline = rag()
+    try:
+        pipeline.embedder.ensure_downloaded()
+    except Exception as exc:
+        log.warning("Embedding model pre-download skipped: %s", exc)
+    try:
+        pipeline.reranker.ensure_downloaded()
+    except Exception as exc:
+        log.warning("Reranker pre-download skipped: %s", exc)
 
+    # ---- Step 2: Jama network pre-flight. ----
     client = jama()
-    # Pre-flight: abort early with a clear network error if the Jama host is
-    # too slow, instead of timing out partway through pagination.
+    if job_id:
+        update_job(conn, job_id, message="Pre-flight network speed test")
     try:
         client.preflight_speed_check()
     except Exception as exc:
@@ -225,6 +241,7 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
         upsert_project(conn, project_id, status="ERROR", error=msg)
         return
 
+    # ---- Step 3: fetch + index items. ----
     if job_id:
         update_job(conn, job_id, message="Fetching items from Jama")
 
