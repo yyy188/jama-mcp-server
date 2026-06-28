@@ -1,0 +1,45 @@
+# =====================================================================
+# Jama MCP Server - Python dependencies
+# ---------------------------------------------------------------------
+# Default index: Aliyun mirror (China mainland acceleration).
+# GitHub-only deps (e.g. sqlite-vec wheels from GitHub releases) are
+# pulled via the secondary index. Pip falls back to it automatically.
+# Install with:  pip install -r requirements.txt
+# =====================================================================
+
+--index-url https://mirrors.aliyun.com/pypi/simple/
+--extra-index-url https://pypi.org/simple/
+
+# --- MCP framework (official Python SDK, exposes FastMCP) ---
+mcp>=1.2.0
+
+# --- HTTP / Jama REST client ---
+requests>=2.31.0
+urllib3>=2.0.0
+
+# --- Storage engine ---
+# sqlite-vec ships prebuilt wheels on PyPI / GitHub releases.
+sqlite-vec>=0.1.6
+# FTS5 is bundled with CPython's sqlite3 module (no extra package needed).
+
+# --- LlamaIndex (primary RAG framework: SentenceSplitter, Document/TextNode,
+#     PromptTemplate, OpenAI LLM for Multi-Query expansion) ---
+llama-index-core>=0.11.0
+llama-index-llms-openai>=0.2.0
+
+# --- HTML cleaning for Jama rich-text fields ---
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# --- Local Qwen3-Reranker-0.6B (CPU) ---
+transformers>=4.44.0
+torch>=2.2.0
+
+# --- Background incremental sync scheduler ---
+APScheduler>=3.10.0
+# APScheduler 3.x imports pkg_resources, which was removed in setuptools>=81.
+setuptools<81
+
+# --- Utilities ---
+python-dotenv>=1.0.0
+tenacity>=8.2.0

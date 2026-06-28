@@ -1,0 +1,411 @@
+"""Jama REST API client.
+
+Responsibilities
+----------------
+* OAuth2 client-credentials token management (auto-refresh on expiry).
+* Resilient HTTP with retries on transient errors and 429 rate limiting.
+* Paginated fetch of project items (including Test Cases with their steps).
+* HTML -> plain-text cleaning for the rich-text ``description`` and
+  ``testCaseSteps`` fields, using BeautifulSoup4.
+
+Read-only by design: this client only issues GET requests against Jama, so it
+can never create, modify or delete data on the Jama instance.
+"""
+from __future__ import annotations
+
+import logging
+import re
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Iterator
+
+import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from config import settings
+from net_guard import NetworkTooSlowError, speed_test
+
+log = logging.getLogger(__name__)
+
+# Jama "Test Case" itemType is global (id 89011) but we detect test cases by
+# the presence of ``testCaseSteps`` to be robust across tenants.
+_TEST_STEPS_KEY = "testCaseSteps"
+
+
+# --------------------------------------------------------------------------- #
+# HTML cleaning
+# --------------------------------------------------------------------------- #
+def clean_html(raw: str | None) -> str:
+    """Convert Jama rich-text HTML to clean plain text.
+
+    Handles <p>, <br>, <li>, <strong>/<b>, tables and HTML entities (&nbsp; …).
+    Block elements are separated by newlines so the splitter keeps structure.
+    """
+    if not raw:
+        return ""
+    # Plain text (Jama sometimes returns already-clean strings).
+    if "<" not in raw and ">" not in raw:
+        return _normalize_ws(raw)
+
+    soup = BeautifulSoup(raw, "lxml")
+
+    # Turn <br> and block closers into newlines before extracting text.
+    for br in soup.find_all(["br"]):
+        br.replace_with("\n")
+    for tag in soup.find_all(["p", "li", "tr", "div", "h1", "h2", "h3", "h4"]):
+        tag.append("\n")
+
+    text = soup.get_text(separator=" ", strip=False)
+    return _normalize_ws(text)
+
+
+def _normalize_ws(text: str) -> str:
+    # Normalize non-breaking spaces and other unicode whitespace to ASCII space.
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[\u2000-\u200a\u202f\u205f\u3000]", " ", text)
+    # Collapse runs of spaces/tabs but keep deliberate newlines.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n[ \n]*", "\n", text)
+    # Drop lines that are only whitespace (artifacts of &nbsp; blocks).
+    text = "\n".join(ln for ln in text.split("\n") if ln.strip())
+    return text.strip()
+
+
+def render_test_steps(steps: Any) -> str:
+    """Render a Test Case's ``testCaseSteps`` list as plain text."""
+    if not steps or not isinstance(steps, list):
+        return ""
+    lines = []
+    for i, st in enumerate(steps, 1):
+        if not isinstance(st, dict):
+            continue
+        action = clean_html(st.get("action", ""))
+        expected = clean_html(st.get("expectedResult", ""))
+        notes = clean_html(st.get("notes", ""))
+        parts = [f"Step {i}: {action}".strip()]
+        if expected:
+            parts.append(f"Expected: {expected}".strip())
+        if notes:
+            parts.append(f"Notes: {notes}".strip())
+        lines.append(" | ".join(p for p in parts if p))
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# HTTP session with retries + rate-limit handling
+# --------------------------------------------------------------------------- #
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=settings.jama.max_retries,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    s.headers.update({"Accept": "application/json"})
+    return s
+
+
+class JamaClient:
+    """Thread-safe, read-only Jama REST client."""
+
+    def __init__(self) -> None:
+        self._s = _build_session()
+        self._token: str | None = None
+        self._token_exp: float = 0.0
+        self._lock = threading.Lock()
+        # itemType id -> display name cache (populated lazily).
+        self._item_types: dict[int, str] = {}
+
+    # ----- auth ---------------------------------------------------------- #
+    def _ensure_token(self) -> str:
+        with self._lock:
+            # Refresh 60s before expiry to be safe.
+            if self._token and time.time() < self._token_exp - 60:
+                return self._token
+            url = f"{settings.jama.url}/rest/oauth/token"
+            r = self._s.post(
+                url,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": settings.jama.client_id,
+                    "client_secret": settings.jama.client_secret,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=settings.jama.request_timeout,
+            )
+            r.raise_for_status()
+            payload = r.json()
+            self._token = payload["access_token"]
+            self._token_exp = time.time() + int(payload.get("expires_in", 3600))
+            log.debug("Jama token refreshed, expires_in=%ss",
+                      payload.get("expires_in"))
+            return self._token
+
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self._ensure_token()}"}
+
+    # ----- pre-flight network speed test -------------------------------- #
+    def preflight_speed_check(self) -> float:
+        """Run a speed test against the Jama host before any bulk download.
+
+        Aborts early with ``NetworkTooSlowError`` if throughput is below the
+        configured floor, so the caller (init/sync) fails fast with a clear
+        network message instead of timing out mid-pagination.
+        """
+        cfg = settings.jama
+        # Fetch a full page (50 projects) so the response body is large enough
+        # to measure bandwidth rather than just TLS-handshake latency.
+        probe_url = (f"{cfg.url}{cfg.api_prefix}/projects"
+                     f"?startAt=0&maxResults={cfg.page_size}")
+        return speed_test(
+            probe_url, min_bytes_per_sec=cfg.min_bytes_per_sec,
+            timeout=cfg.speed_test_timeout, headers=self._headers(),
+            label="jama")
+
+    # ----- single GET (with token refresh + 429 backoff) ---------------- #
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        url = f"{settings.jama.url}{settings.jama.api_prefix}{path}"
+        r = self._s.get(url, headers=self._headers(), params=params or {},
+                        timeout=settings.jama.request_timeout)
+        # 401 -> token may have been revoked mid-flight; refresh once.
+        if r.status_code == 401:
+            with self._lock:
+                self._token = None
+            r = self._s.get(url, headers=self._headers(), params=params or {},
+                            timeout=settings.jama.request_timeout)
+        if r.status_code == 429:  # explicit backoff beyond urllib3's handling
+            retry_after = int(r.headers.get("Retry-After", "5") or 5)
+            log.warning("Jama 429 rate limit; sleeping %ss", retry_after)
+            time.sleep(min(retry_after, 30))
+            return self._get(path, params)
+        r.raise_for_status()
+        return r.json()
+
+    def _get_page_with_stall_retry(self, path: str,
+                                   params: dict) -> dict:
+        """Fetch one page, retrying on timeout/stall/slow-throughput.
+
+        Measures throughput over the response body; if it drops below
+        ``page_min_bytes_per_sec`` or a network timeout occurs, retry with
+        backoff up to ``page_max_retries``. This is what makes long paginated
+        downloads resilient to mid-stream network hiccups.
+        """
+        cfg = settings.jama
+        url = f"{cfg.url}{cfg.api_prefix}{path}"
+        last_err: Exception | None = None
+        for attempt in range(1, cfg.page_max_retries + 1):
+            t0 = time.monotonic()
+            try:
+                r = self._s.get(url, headers=self._headers(), params=params,
+                                timeout=cfg.request_timeout)
+                if r.status_code == 401:
+                    with self._lock:
+                        self._token = None
+                if r.status_code == 429:
+                    retry_after = int(r.headers.get("Retry-After", "5") or 5)
+                    log.warning("Jama 429 rate limit; sleeping %ss", retry_after)
+                    time.sleep(min(retry_after, 30))
+                    continue
+                r.raise_for_status()
+                body = r.content
+                elapsed = max(time.monotonic() - t0, 0.001)
+                bps = len(body) / elapsed
+                if bps < cfg.page_min_bytes_per_sec and len(body) > 1024:
+                    raise NetworkTooSlowError(
+                        f"Jama page fetch too slow: {bps:.0f} bytes/s < floor "
+                        f"{cfg.page_min_bytes_per_sec} (attempt "
+                        f"{attempt}/{cfg.page_max_retries})")
+                return r.json()
+            except (requests.Timeout, requests.ConnectionError,
+                    NetworkTooSlowError) as exc:
+                last_err = exc
+                log.warning("Jama page fetch attempt %d/%d stalled/errored: "
+                            "%s", attempt, cfg.page_max_retries, exc)
+                time.sleep(min(2 ** attempt, 10))
+        raise NetworkTooSlowError(
+            f"Jama page fetch failed after {cfg.page_max_retries} retries: "
+            f"{last_err}. Network problem — check connectivity.")
+
+    # ----- generic GET with pagination ---------------------------------- #
+    def _paginate(self, path: str, params: dict | None = None,
+                  max_pages: int | None = None) -> Iterator[dict]:
+        """Yield items across all pages of a list endpoint.
+
+        Each page is fetched via ``_get_page_with_stall_retry`` so mid-stream
+        network stalls/timeouts trigger a retry rather than aborting the whole
+        download.
+        """
+        base = dict(params or {})
+        page = 0
+        start_at = 0
+        while True:
+            page_params = {**base, "startAt": start_at,
+                           "maxResults": settings.jama.page_size}
+            data = self._get_page_with_stall_retry(path, page_params)
+            items = data.get("data", []) or []
+            for it in items:
+                yield it
+            page_info = data.get("meta", {}).get("pageInfo", {})
+            total = int(page_info.get("totalResults", 0) or 0)
+            result_count = int(page_info.get("resultCount", 0) or 0)
+            start_at += result_count
+            page += 1
+            if result_count == 0 or start_at >= total:
+                break
+            if max_pages and page >= max_pages:
+                break
+            if settings.jama.page_delay:
+                time.sleep(settings.jama.page_delay)
+
+    # ----- item types ---------------------------------------------------- #
+    def load_item_types(self) -> dict[int, str]:
+        """Cache and return {itemType id -> display name}."""
+        if self._item_types:
+            return self._item_types
+        try:
+            for it in self._paginate("/itemtypes", max_pages=5):
+                if isinstance(it, dict):
+                    self._item_types[it.get("id")] = it.get("display") or \
+                        it.get("displayPlural") or str(it.get("id"))
+        except Exception as exc:
+            log.warning("Could not load item types: %s", exc)
+        return self._item_types
+
+    def item_type_name(self, item_type_id: int | None) -> str:
+        if item_type_id is None:
+            return "Unknown"
+        if not self._item_types:
+            self.load_item_types()
+        return self._item_types.get(item_type_id, f"Type {item_type_id}")
+
+    # ----- public read API ---------------------------------------------- #
+    def get_project(self, project_id: int) -> dict | None:
+        try:
+            data = self._get(f"/projects/{project_id}")
+            return data.get("data") if isinstance(data, dict) else None
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+
+    def iter_project_items(self, project_id: int,
+                           modified_after: str | None = None,
+                           max_items: int | None = None) -> Iterator[dict]:
+        """Yield normalized item dicts for a project.
+
+        ``modified_after`` (ISO-8601) enables incremental sync: only items
+        whose ``modifiedDate`` is strictly greater are yielded. Filtering is
+        done client-side because Jama's REST API has no server-side
+        modified-date filter.
+        """
+        self.load_item_types()
+        count = 0
+        for raw in self._paginate("/items", {"project": project_id}):
+            norm = self._normalize_item(raw)
+            if modified_after and norm["modified_date"] and \
+                    norm["modified_date"] <= modified_after:
+                continue
+            yield norm
+            count += 1
+            if max_items and count >= max_items:
+                break
+
+    def _normalize_item(self, raw: dict) -> dict:
+        """Flatten a Jama item payload into our storage shape + cleaned text."""
+        fields = raw.get("fields", {}) or {}
+        desc = clean_html(fields.get("description", ""))
+        steps = render_test_steps(fields.get(_TEST_STEPS_KEY))
+        item_type = raw.get("itemType")
+        # Status lives under different field keys per type; pick the first known.
+        status = (fields.get("status") or fields.get("testCaseStatus")
+                  or fields.get("testRunStatus") or "")
+        return {
+            "item_id": raw.get("id"),
+            "project_id": raw.get("project"),
+            "document_key": raw.get("documentKey"),
+            "global_id": raw.get("globalId"),
+            "item_type": item_type,
+            "item_type_name": self.item_type_name(item_type),
+            "name": (fields.get("name") or "").strip(),
+            "status": status,
+            "description": desc,
+            "test_steps": steps,
+            "modified_date": raw.get("modifiedDate"),
+            "created_date": raw.get("createdDate"),
+            "raw_json": _safe_dumps(raw),
+        }
+
+    # ----- native metadata query (for query_jama_native_metadata) ------ #
+    def query_items_native(self, project_id: int, *,
+                           document_key: str | None = None,
+                           item_type: int | None = None,
+                           status: str | None = None,
+                           keyword: str | None = None,
+                           limit: int = 20) -> list[dict]:
+        """Direct Jama REST filtering with client-side refinement.
+
+        Uses ``/abstractitems`` because it honours ``itemType``,
+        ``contains`` and ``documentKey`` server-side filters (the ``/items``
+        endpoint ignores ``itemType``). ``status`` has no server-side filter,
+        so it is applied client-side. Pagination is walked until ``limit``
+        matches are collected or the well is empty.
+        """
+        params: dict[str, Any] = {"project": project_id}
+        if item_type is not None:
+            params["itemType"] = item_type
+        if keyword:
+            params["contains"] = keyword
+        if document_key:
+            # server-side exact match (much faster than client-side walk)
+            params["documentKey"] = document_key
+
+        results: list[dict] = []
+        seen = 0
+        for raw in self._paginate("/abstractitems", params, max_pages=50):
+            seen += 1
+            fields = raw.get("fields", {}) or {}
+            doc_key = raw.get("documentKey")
+            item_status = (fields.get("status") or fields.get("testCaseStatus")
+                           or fields.get("testRunStatus") or "")
+            # document_key already filtered server-side; this is a safety net.
+            if document_key and (doc_key or "").upper() != document_key.upper():
+                continue
+            if status and (item_status or "").upper() != status.upper():
+                continue
+            results.append({
+                "item_id": raw.get("id"),
+                "document_key": doc_key,
+                "global_id": raw.get("globalId"),
+                "item_type": raw.get("itemType"),
+                "item_type_name": self.item_type_name(raw.get("itemType")),
+                "name": (fields.get("name") or "").strip(),
+                "status": item_status,
+                "modified_date": raw.get("modifiedDate"),
+                "description": clean_html(fields.get("description", ""))[:500],
+            })
+            if len(results) >= limit:
+                break
+            # Safety: don't walk more than a few thousand raw rows.
+            if seen >= 2000:
+                break
+        return results
+
+
+def _safe_dumps(obj: Any) -> str:
+    try:
+        import json
+        return json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        return str(obj)
+
+
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f+0000")
