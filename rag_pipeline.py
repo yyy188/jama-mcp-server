@@ -260,6 +260,11 @@ class LocalEmbeddingClient:
 
     _instance: "LocalEmbeddingClient | None" = None
     _lock = threading.Lock()
+    # Serializes the fastembed download so a concurrent bootstrap + sync can't
+    # both trigger it (fastembed/huggingface_hub write shared cache files; two
+    # concurrent fetches risk a corrupted/partial cache). Re-checks presence
+    # inside (double-checked locking).
+    _download_lock = threading.Lock()
 
     def __new__(cls):
         with cls._lock:
@@ -276,6 +281,7 @@ class LocalEmbeddingClient:
         self._model = None  # fastembed.TextEmbedding, lazy
         self._load_error: str | None = None
         self._embed_lock = threading.Lock()
+        self._hf_repo: str | None = None  # cached by _resolve_hf_repo
 
     # ----- model loading + download ------------------------------------- #
     def _thread_count(self) -> int:
@@ -289,22 +295,52 @@ class LocalEmbeddingClient:
         from config import USER_DIR
         return os.environ.get("HF_HOME", str(USER_DIR / "huggingface"))
 
+    def _resolve_hf_repo(self) -> str:
+        """The HF repo fastembed actually pulls from for our model.
+
+        We configure the model by its BAAI name (``BAAI/bge-small-en-v1.5``),
+        but fastembed downloads the ONNX weights from a Qdrant-published repo
+        (``qdrant/bge-small-en-v1.5-onnx-q``). The cache directory is named
+        after THAT repo, so cache-detection and the download speed-test probe
+        must use it, not the configured name. Falls back to the configured
+        model name if fastembed's model registry can't be read.
+
+        Cached on the instance after first resolution (fastembed's
+        ``list_supported_models`` re-iterates every supported model each call —
+        avoid doing that on every sync progress sample / presence check).
+        """
+        cached = getattr(self, "_hf_repo", None)
+        if cached is not None:
+            return cached
+        try:
+            from fastembed import TextEmbedding
+            model_meta = next(
+                (m for m in TextEmbedding.list_supported_models()
+                 if m["model"] == self._cfg.local_model), None)
+            repo = (model_meta or {}).get("sources", {}).get(
+                "hf", self._cfg.local_model)
+        except Exception:
+            repo = self._cfg.local_model
+        self._hf_repo = repo
+        return repo
+
     def _model_present(self) -> bool:
         """True if the bge-small-en-v1.5 ONNX model is already cached locally."""
-        # fastembed stores models under <cache>/models--<org>--<name>. We check
-        # for the snapshot dir with the ONNX file present.
-        model = self._cfg.local_model
-        repo_dir = "models--" + model.replace("/", "--")
-        base = os.path.join(self._cache_dir(), "models", model)
-        # fastembed uses a slightly different layout: <cache>/models/<org>/<name>
-        # and also <cache>/models--<org>--<name>. Probe both.
-        candidates = [
-            os.path.join(self._cache_dir(), "models", model),
-            os.path.join(self._cache_dir(), repo_dir),
-        ]
+        # fastembed caches under <cache>/models--<org>--<name> (hf-style) and/or
+        # <cache>/models/<org>/<name> (fastembed-style), named after the REAL
+        # hf repo it pulls from (qdrant/...), not the BAAI name in config. Probe
+        # both repos (real + configured fallback) under both layouts, and treat
+        # presence of any .onnx file as "downloaded".
+        repos = {self._resolve_hf_repo(), self._cfg.local_model}
+        cache = self._cache_dir()
+        candidates = []
+        for repo in repos:
+            repo_dir = "models--" + repo.replace("/", "--")
+            candidates.append(os.path.join(cache, repo_dir))
+            candidates.append(os.path.join(cache, "models", repo))
         for c in candidates:
             if os.path.isdir(c):
-                for dirpath, _dirs, files in os.walk(c):
+                for _dirpath, _dirs, files in os.walk(c):
                     if any(f.endswith(".onnx") for f in files):
                         return True
         return False
@@ -321,66 +357,75 @@ class LocalEmbeddingClient:
         from net_guard import speed_test, NetworkTooSlowError
         from fastembed import TextEmbedding
 
-        # fastembed downloads the ONNX model from a Qdrant-published repo, not
-        # the original BAAI repo. Resolve the real HF source so the speed-test
-        # probe hits a file that actually exists.
-        model_meta = next(
-            (m for m in TextEmbedding.list_supported_models()
-             if m["model"] == self._cfg.local_model), None)
-        hf_repo = (model_meta or {}).get("sources", {}).get("hf", self._cfg.local_model)
-        model_file = (model_meta or {}).get("model_file", "model_optimized.onnx")
-
-        mirrors = [
-            ("China mirror", "https://hf-mirror.com"),
-            ("HuggingFace (global)", "https://huggingface.co"),
-        ]
-        min_bps = self._cfg.download_min_bps
-        # Probe URL for the speed test: a small file from the ONNX model repo.
-        probe_path = f"{hf_repo}/resolve/main/config.json"
-
-        last_err: str | None = None
-        for label, endpoint in mirrors:
-            os.environ["HF_ENDPOINT"] = endpoint
-            probe_url = f"{endpoint}/{probe_path}"
-            try:
-                bps = speed_test(probe_url, min_bytes_per_sec=min_bps,
-                                 timeout=20, label=f"emb-{label}")
-                log.info("Embedding model mirror %s OK: %.0f bytes/s", label, bps)
-            except NetworkTooSlowError as exc:
-                last_err = f"{label} ({endpoint}): {exc}"
-                log.warning("Embedding mirror %s too slow/unreachable: %s",
-                            label, exc)
-                continue
-            # Mirror is fast enough — trigger the actual download by
-            # constructing TextEmbedding (it downloads on first use).
-            try:
-                log.info("Downloading %s (ONNX from %s) via %s ...",
-                         self._cfg.local_model, hf_repo, label)
-                te = TextEmbedding(
-                    model_name=self._cfg.local_model,
-                    cache_dir=self._cache_dir(),
-                    threads=self._thread_count(),
-                    cuda=False,
-                )
-                # Force the actual model load (download + ONNX init) now so a
-                # download failure surfaces here, not on the first embed.
-                _ = list(te.embed(["warmup"], batch_size=1))
-                self._model = te
-                log.info("Local embedding model ready (%s, %d CPU threads).",
-                         self._cfg.local_model, self._thread_count())
+        # Serialize: a concurrent bootstrap + sync could both reach here and
+        # trigger fastembed/huggingface_hub to fetch the same files at once,
+        # risking a corrupted/partial cache. Re-check presence inside the lock
+        # (another thread may have just finished downloading it).
+        with self._download_lock:
+            if self._model_present():
+                log.info("Embedding model cached by a concurrent download; "
+                         "skipping.")
                 return
-            except Exception as exc:
-                last_err = f"{label} download failed: {exc}"
-                log.warning("Embedding download from %s failed: %s", label, exc)
-                continue
+            # fastembed downloads the ONNX model from a Qdrant-published repo,
+            # not the original BAAI repo. Resolve the real HF source (shared
+            # with _model_present) so the speed-test probe hits a real file.
+            hf_repo = self._resolve_hf_repo()
+            model_meta = next(
+                (m for m in TextEmbedding.list_supported_models()
+                 if m["model"] == self._cfg.local_model), None)
+            model_file = (model_meta or {}).get("model_file", "model_optimized.onnx")
 
-        # Both mirrors failed.
-        self._load_error = (
-            f"Could not download embedding model {self._cfg.local_model} "
-            f"(ONNX source {hf_repo}/{model_file}) from any mirror. "
-            f"Last error: {last_err}. Check network connectivity or "
-            f"pre-download the model manually into {self._cache_dir()}.")
-        raise RuntimeError(self._load_error)
+            mirrors = [
+                ("China mirror", "https://hf-mirror.com"),
+                ("HuggingFace (global)", "https://huggingface.co"),
+            ]
+            min_bps = self._cfg.download_min_bps
+            # Probe URL for the speed test: a small file from the ONNX model repo.
+            probe_path = f"{hf_repo}/resolve/main/config.json"
+
+            last_err: str | None = None
+            for label, endpoint in mirrors:
+                os.environ["HF_ENDPOINT"] = endpoint
+                probe_url = f"{endpoint}/{probe_path}"
+                try:
+                    bps = speed_test(probe_url, min_bytes_per_sec=min_bps,
+                                     timeout=20, label=f"emb-{label}")
+                    log.info("Embedding model mirror %s OK: %.0f bytes/s", label, bps)
+                except NetworkTooSlowError as exc:
+                    last_err = f"{label} ({endpoint}): {exc}"
+                    log.warning("Embedding mirror %s too slow/unreachable: %s",
+                                label, exc)
+                    continue
+                # Mirror is fast enough — trigger the actual download by
+                # constructing TextEmbedding (it downloads on first use).
+                try:
+                    log.info("Downloading %s (ONNX from %s) via %s ...",
+                             self._cfg.local_model, hf_repo, label)
+                    te = TextEmbedding(
+                        model_name=self._cfg.local_model,
+                        cache_dir=self._cache_dir(),
+                        threads=self._thread_count(),
+                        cuda=False,
+                    )
+                    # Force the actual model load (download + ONNX init) now so a
+                    # download failure surfaces here, not on the first embed.
+                    _ = list(te.embed(["warmup"], batch_size=1))
+                    self._model = te
+                    log.info("Local embedding model ready (%s, %d CPU threads).",
+                             self._cfg.local_model, self._thread_count())
+                    return
+                except Exception as exc:
+                    last_err = f"{label} download failed: {exc}"
+                    log.warning("Embedding download from %s failed: %s", label, exc)
+                    continue
+
+            # Both mirrors failed.
+            self._load_error = (
+                f"Could not download embedding model {self._cfg.local_model} "
+                f"(ONNX source {hf_repo}/{model_file}) from any mirror. "
+                f"Last error: {last_err}. Check network connectivity or "
+                f"pre-download the model manually into {self._cache_dir()}.")
+            raise RuntimeError(self._load_error)
 
     def _load(self) -> bool:
         """Load the model (cached or freshly downloaded). True on success."""
@@ -565,6 +610,10 @@ class QwenReranker:
 
     _instance: "QwenReranker | None" = None
     _lock = threading.Lock()
+    # Serializes the manual weights download so a concurrent bootstrap + sync
+    # can't both write the same dest file (cache corruption). Held only across
+    # the download section, with a re-check inside (double-checked locking).
+    _weights_lock = threading.Lock()
 
     def __new__(cls):
         with cls._lock:
@@ -582,7 +631,7 @@ class QwenReranker:
         self._model = None
         self._load_error: str | None = None
 
-    def ensure_downloaded(self) -> None:
+    def ensure_downloaded(self, progress_callback=None) -> None:
         """Pre-download reranker weights without loading the model.
 
         Called during project sync so the (1.2 GB) download happens up front,
@@ -590,11 +639,14 @@ class QwenReranker:
         (where a download failure would surprise the user mid-query). If the
         weights are already cached this is a no-op. A failure here is
         non-fatal: the reranker stays unloaded and search degrades to RRF.
+
+        ``progress_callback(received, expected)`` is forwarded to the
+        safetensors download so the bootstrap monitor can report live bytes.
         """
         if self._model is not None or self._load_error is not None:
             return
         try:
-            self._ensure_weights_downloaded()
+            self._ensure_weights_downloaded(progress_callback=progress_callback)
             log.info("Qwen3-Reranker weights ready (pre-downloaded during sync).")
         except Exception as exc:
             log.warning("Qwen3-Reranker pre-download failed (%s); "
@@ -636,7 +688,37 @@ class QwenReranker:
                         "RRF fallback will be used.", exc)
             return False
 
-    def _ensure_weights_downloaded(self) -> str | None:
+    def _manual_weights_path(self) -> tuple[str, str]:
+        """Local ``(dest_dir, model.safetensors path)`` for the manual download.
+
+        Used when the HF-cache fast path fails: weights are fetched into a
+        project-local snapshot dir so transformers can load fully offline.
+        Centralised so cache-detection (``weights_cached``) and the download
+        path can't drift apart.
+        """
+        import os
+        from config import USER_DIR
+        cache_dir = os.environ.get("HF_HOME", str(USER_DIR / "huggingface"))
+        dest_dir = os.path.join(cache_dir, "hub",
+                                "models--" + self._cfg.model_name.replace("/", "--"),
+                                "snapshots", "manual")
+        return dest_dir, os.path.join(dest_dir, "model.safetensors")
+
+    def weights_cached(self) -> bool:
+        """True if the reranker weights are already on disk (lightweight, no network).
+
+        Checks only the manual snapshot dir — the location ``_ensure_weights_downloaded``
+        writes to when the HF-cache fast path fails (common on this network).
+        A false negative is harmless: ``bootstrap_models`` would re-download and
+        then no-op. Used by the startup hint, not by the load path.
+        """
+        if self._model is not None:
+            return True
+        import os
+        _dest_dir, dest = self._manual_weights_path()
+        return os.path.exists(dest) and os.path.getsize(dest) > 0
+
+    def _ensure_weights_downloaded(self, progress_callback=None) -> str | None:
         """Make sure Qwen3-Reranker weights are cached locally.
 
         Returns the local directory to load from, or None if the model is
@@ -645,6 +727,9 @@ class QwenReranker:
         the safetensors with resume + stall retry into a local dir (with the
         tokenizer/config files copied alongside) so transformers can load
         offline. Raises ``NetworkTooSlowError`` on a slow/failed mirror.
+
+        The manual download is serialized by ``_weights_lock`` with a re-check
+        inside, so a concurrent bootstrap + sync can't both write the same dest.
         """
         import os
         from huggingface_hub import hf_hub_download
@@ -653,72 +738,68 @@ class QwenReranker:
 
         cfg = self._cfg
         # Fast path: weights already in the HF cache -> load by model name.
+        # (hf_hub_download is internally locked by huggingface_hub, so concurrent
+        # callers here are safe.)
         try:
             path = hf_hub_download(repo_id=cfg.model_name,
                                    filename="model.safetensors")
             if os.path.getsize(path) > 0:
                 return None  # use model_name; transformers resolves the cache
         except Exception:
-            pass  # not cached yet — fall through to guarded download
+            pass  # not cached yet — fall through to guarded manual download
 
         endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
         url = (f"{endpoint.rstrip('/')}/{cfg.model_name}/resolve/main/"
                f"model.safetensors")
-        # Fast path: weights already downloaded into the project-local cache.
-        # We MUST check this BEFORE the network speed test, otherwise a
-        # transient network blip makes speed_test fail and degrades to RRF even
-        # though the model is fully present on disk. Re-verifying the small
-        # tokenizer/config files too lets us return a fully-offline load path.
-        from config import USER_DIR
-        cache_dir = os.environ.get("HF_HOME", str(USER_DIR / "huggingface"))
-        dest_dir = os.path.join(cache_dir, "hub",
-                                "models--" + cfg.model_name.replace("/", "--"),
-                                "snapshots", "manual")
-        dest = os.path.join(dest_dir, "model.safetensors")
         small_files = ("config.json", "tokenizer.json",
                        "tokenizer_config.json", "vocab.json", "merges.txt",
                        "chat_template.jinja")
-        if (os.path.exists(dest) and os.path.getsize(dest) > 0
-                and all(os.path.exists(os.path.join(dest_dir, f))
-                        and os.path.getsize(os.path.join(dest_dir, f)) > 0
-                        for f in small_files)):
-            log.info("Qwen3-Reranker weights cached locally at %s; "
-                     "skipping network check.", dest_dir)
+        # Manual download path — serialized. Re-check the local cache AFTER
+        # acquiring the lock: another thread (e.g. bootstrap while a sync also
+        # calls ensure_downloaded) may have just finished writing the weights,
+        # in which case we skip the network entirely. We MUST check before the
+        # speed test so a transient network blip doesn't degrade to RRF when the
+        # model is fully present on disk.
+        with self._weights_lock:
+            dest_dir, dest = self._manual_weights_path()
+            if (os.path.exists(dest) and os.path.getsize(dest) > 0
+                    and all(os.path.exists(os.path.join(dest_dir, f))
+                            and os.path.getsize(os.path.join(dest_dir, f)) > 0
+                            for f in small_files)):
+                log.info("Qwen3-Reranker weights cached locally at %s; "
+                         "skipping network check.", dest_dir)
+                return dest_dir
+            # Pre-flight speed test against the mirror (1 MB probe). Aborts with
+            # a clear network error if the mirror is too slow.
+            speed_test(url, min_bytes_per_sec=cfg.hf_min_bytes_per_sec,
+                       timeout=cfg.hf_speed_test_timeout, label="hf-mirror")
+            # Download weights (resumable, stall-retried) into a local snapshot
+            # dir under the project-local HF cache (user/huggingface/hub/...).
+            os.makedirs(dest_dir, exist_ok=True)
+            download_with_retry(url, dest,
+                                min_bytes_per_sec=cfg.hf_min_bytes_per_sec,
+                                max_retries=cfg.hf_download_retries,
+                                label="qwen3-reranker",
+                                progress_callback=progress_callback)
+            # Fetch the small tokenizer/config files into the same snapshot dir
+            # so AutoTokenizer/AutoModel can load fully offline. These are tiny
+            # (<15MB total), so download directly by URL with light retry rather
+            # than relying on hf_hub_download (which may HEAD-fail here).
+            for fname in small_files:
+                link = os.path.join(dest_dir, fname)
+                if os.path.exists(link) and os.path.getsize(link) > 0:
+                    continue
+                furl = (f"{endpoint.rstrip('/')}/{cfg.model_name}/resolve/main/"
+                        f"{fname}")
+                try:
+                    download_with_retry(furl, link,
+                                        min_bytes_per_sec=1_000,  # tiny files
+                                        max_retries=cfg.hf_download_retries,
+                                        chunk_timeout=20,
+                                        label=f"qwen3-{fname}")
+                except Exception as exc:
+                    log.warning("Could not fetch %s: %s", fname, exc)
             return dest_dir
-        # Pre-flight speed test against the mirror (1 MB probe). Aborts with a
-        # clear network error if the mirror is too slow.
-        speed_test(url, min_bytes_per_sec=cfg.hf_min_bytes_per_sec,
-                   timeout=cfg.hf_speed_test_timeout, label="hf-mirror")
-        # Download weights (resumable, stall-retried) into a local snapshot dir
-        # under the project-local HF cache (user/huggingface/hub/...).
-        os.makedirs(dest_dir, exist_ok=True)
-        download_with_retry(url, dest,
-                            min_bytes_per_sec=cfg.hf_min_bytes_per_sec,
-                            max_retries=cfg.hf_download_retries,
-                            label="qwen3-reranker")
-        # Fetch the small tokenizer/config files into the same snapshot dir so
-        # AutoTokenizer/AutoModel can load fully offline. These are tiny (<15MB
-        # total), so we download them directly by URL with light retry rather
-        # than relying on hf_hub_download (which may HEAD-fail on this network).
-        import shutil
-        small_files = ("config.json", "tokenizer.json",
-                       "tokenizer_config.json", "vocab.json", "merges.txt",
-                       "chat_template.jinja")
-        for fname in small_files:
-            link = os.path.join(dest_dir, fname)
-            if os.path.exists(link) and os.path.getsize(link) > 0:
-                continue
-            furl = (f"{endpoint.rstrip('/')}/{cfg.model_name}/resolve/main/"
-                    f"{fname}")
-            try:
-                download_with_retry(furl, link,
-                                    min_bytes_per_sec=1_000,  # tiny files: low floor
-                                    max_retries=cfg.hf_download_retries,
-                                    chunk_timeout=20,
-                                    label=f"qwen3-{fname}")
-            except Exception as exc:
-                log.warning("Could not fetch %s: %s", fname, exc)
-        return dest_dir
 
     def rerank(self, query: str, texts: list[str],
                batch_size: int | None = None) -> list[float]:

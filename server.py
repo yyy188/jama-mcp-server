@@ -1,14 +1,20 @@
 """Jama MCP Server entry point.
 
-Exposes four tools to LLM clients via the Model Context Protocol:
+Exposes MCP tools to LLM clients (Model Context Protocol, stdio transport):
+  * bootstrap_models        - async pre-download of embedding + reranker models
   * init_jama_project        - async background init (returns job_id)
-  * get_sync_progress        - poll job progress
+  * reinit_jama_project      - async full re-sync of an initialized project
+  * get_sync_progress / get_bootstrap_progress - poll job progress
+  * get_sync_status          - project monitor: in-flight + last run of each kind
   * search_jama_semantics    - high-precision RAG (client multi-query + hybrid + RRF + rerank)
   * query_jama_native_metadata - direct Jama REST filtering (exact metadata)
+  * plus read-only Jama browse tools (items, relationships, releases, ...)
 
-Also runs an APScheduler job that incrementally syncs initialized projects
-every N hours: it walks items whose modifiedDate > last_sync_time, cleans
-them, re-chunks and updates the FTS5 + sqlite-vec indexes.
+All sync operations (init / reinit / scheduled incremental / model bootstrap)
+run as async background jobs in a thread pool and report progress into the
+``sync_jobs`` table, pollable every ~2 min. An APScheduler job incrementally
+syncs initialized projects every N hours: it walks items whose modifiedDate >
+last_sync_time, cleans them, re-chunks and updates the FTS5 + sqlite-vec indexes.
 
 Run with:  python server.py
 Configure an MCP client (Claude Desktop, etc.) to launch this as a stdio server.
@@ -16,7 +22,9 @@ Configure an MCP client (Claude Desktop, etc.) to launch this as a stdio server.
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -25,10 +33,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from mcp.server.fastmcp import FastMCP
 
 from config import reload_settings, settings, write_env_file
-from db_setup import (count_chunks, create_job, get_connection, get_job,
+from db_setup import (count_chunks, create_job, get_active_job_for_project,
+                      get_connection, get_job, get_latest_job_for_project,
                       get_project, init_db, list_initialized_projects,
-                      update_job, upsert_item, upsert_project,
-                      replace_chunks, write_txn)
+                      reconcile_stale_jobs, update_job, upsert_item,
+                      upsert_project, replace_chunks, write_txn)
 from jama_client import JamaClient, utcnow_iso
 from preflight import preflight
 from rag_pipeline import RAGPipeline, chunk_item
@@ -47,6 +56,13 @@ _jama: JamaClient | None = None
 _rag: RAGPipeline | None = None
 _init_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jama-job")
+
+# Jama pre-flight speed-test retry. The test measures live throughput, so a
+# momentary blip can drop it below the floor even on a healthy link; retry a
+# couple of times with backoff before marking a project ERROR (a false ERROR
+# needs a manual re-init to clear, so we err on the side of retrying).
+_PREFLIGHT_RETRIES = 3
+_PREFLIGHT_BACKOFF = 5  # seconds between attempts
 
 # Per-project sync locks. ``_sync_project`` acquires the lock for its project
 # so that a user-triggered init and a scheduler-triggered incremental sync can
@@ -109,11 +125,35 @@ the `sub_queries` parameter; keep the original query in `query` (it is
 the rerank reference). This maximizes recall for RRF fusion and is
 preferred over letting the server fall back to lexical variants.
 
+MODEL BOOTSTRAP (first-run, before any init). The embedding model (~67MB)
+and Qwen3 reranker weights (~1.2GB) are NOT bundled — they download on first
+use. Call `bootstrap_models()` right after the server is configured: it
+downloads BOTH models asynchronously and returns a job_id immediately, so the
+first sync isn't slowed by a download and a download failure surfaces here
+instead of mid-sync. Poll `get_bootstrap_progress(job_id)` roughly every 2
+minutes, reporting each sample (status, progress %, message with live download
+bytes for the reranker, e.g. "Downloading reranker weights: 680/1200 MB") to the
+user, until status is DONE or ERROR. Already-cached models are skipped, so
+re-running bootstrap after success is a fast no-op. OPTIONAL: if skipped,
+init/sync still works (downloads on demand) but the first sync is slower and a
+download failure surfaces mid-sync — prefer running bootstrap first.
+
+SYNC MONITORING. `init_jama_project` (first init) and `reinit_jama_project`
+(re-index an already-initialized project) run in the BACKGROUND and return a
+job_id immediately — they are never blocking. Scheduled incremental syncs run
+automatically (every ~2h) with no job_id returned to you. After starting an
+init or reinit, poll `get_sync_progress(job_id)` roughly every 2 minutes,
+reporting each sample (status, done/total, message) to the user, until status
+is DONE or ERROR. For a single project-wide view — the in-flight job plus the
+last init/reinit/sync run and live process metrics — call
+`get_sync_status(project_id)` at the same ~2-minute cadence. Do NOT busy-poll
+(every few seconds); syncs index many items and take minutes.
+
 PREREQUISITE: `search_jama_semantics` needs the project initialized first
-(`init_jama_project` → poll `get_sync_progress` until DONE). The native
-and browse tools work immediately against the live Jama API — no init
-required. If a project is not initialized, suggest `init_jama_project`
-before falling back to native metadata.
+(`init_jama_project` → poll `get_sync_progress` until DONE, roughly every 2
+minutes). The native and browse tools work immediately against the live Jama
+API — no init required. If a project is not initialized, suggest
+`init_jama_project` before falling back to native metadata.
 """
 
 mcp = FastMCP("jama-mcp", instructions=JAMA_MCP_INSTRUCTIONS)
@@ -227,14 +267,33 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
     except Exception as exc:
         log.warning("Reranker pre-download skipped: %s", exc)
 
-    # ---- Step 2: Jama network pre-flight. ----
+    # ---- Step 2: Jama network pre-flight (with transient-failure retry). ----
+    # The speed test measures live throughput; a momentary network blip can
+    # drop it below the floor even though the link is fine a second later.
+    # Retrying a couple of times with backoff avoids a flaky pre-flight marking
+    # the whole project ERROR (which then needs a re-init to recover). Only a
+    # SUSTAINED failure (all retries exhausted) is treated as a real error.
     client = jama()
     if job_id:
         update_job(conn, job_id, message="Pre-flight network speed test")
-    try:
-        client.preflight_speed_check()
-    except Exception as exc:
-        msg = f"Network pre-flight check failed: {exc}"
+    preflight_err: Exception | None = None
+    for attempt in range(1, _PREFLIGHT_RETRIES + 1):
+        try:
+            client.preflight_speed_check()
+            preflight_err = None
+            break
+        except Exception as exc:
+            preflight_err = exc
+            if attempt < _PREFLIGHT_RETRIES:
+                log.warning("Pre-flight attempt %d/%d failed (%s); retrying in %ds",
+                            attempt, _PREFLIGHT_RETRIES, exc, _PREFLIGHT_BACKOFF)
+                if job_id:
+                    update_job(conn, job_id,
+                               message=f"Pre-flight retry {attempt}/{_PREFLIGHT_RETRIES}")
+                time.sleep(_PREFLIGHT_BACKOFF)
+    if preflight_err is not None:
+        msg = (f"Network pre-flight check failed after {_PREFLIGHT_RETRIES} "
+               f"attempts: {preflight_err}")
         log.error(msg)
         if job_id:
             update_job(conn, job_id, status="ERROR", message=msg)
@@ -444,15 +503,148 @@ def _run_job(project_id: int, job_id: str, incremental: bool) -> None:
                       project_id)
 
 
+def _run_bootstrap_job(job_id: str) -> None:
+    """Background worker: pre-download embedding + reranker models.
+
+    Reports live progress into the ``sync_jobs`` row (kind="bootstrap") so
+    ``get_bootstrap_progress`` can be polled every ~2 min. The reranker
+    download (1.2 GB, our own ``download_with_retry``) feeds a real
+    received/expected byte callback; the embedding download (67 MB, fastembed
+    black box) only reports phase transitions (downloading -> ready) since
+    fastembed exposes no byte callback. Either model already cached skips its
+    download. Failures are non-fatal per-model (marked in the message) but the
+    job still ends ERROR if any model is missing at the end.
+    """
+    conn = db()
+
+    def _set(progress: float, message: str) -> None:
+        try:
+            update_job(conn, job_id, progress=progress, message=message)
+        except Exception:
+            pass
+
+    errors: list[str] = []
+    pipeline = rag()
+    provider = settings.embedding.provider
+
+    # --- Phase 1: embedding model (local only; azure needs no download) ------
+    if provider == "local":
+        _set(0.1, "Checking/downloading embedding model (bge-small-en-v1.5, ~67MB)")
+        emb = pipeline.embedder
+        try:
+            if emb._model_present():  # type: ignore[attr-defined]
+                _set(0.2, "Embedding model already cached")
+            else:
+                emb._download_model()  # type: ignore[attr-defined]
+                _set(0.45, "Embedding model downloaded")
+        except Exception as exc:
+            msg = f"Embedding model download failed: {exc}"
+            log.error("Bootstrap %s: %s", job_id, msg)
+            errors.append(msg)
+    else:
+        _set(0.45, f"Embedding provider is {provider} (no model to download)")
+
+    # --- Phase 2: reranker weights (download_with_retry, real byte progress) -
+    _set(0.5, "Checking/downloading reranker weights (Qwen3-Reranker-0.6B, ~1.2GB)")
+
+    def _reranker_cb(received: int, expected: int | None) -> None:
+        # Map reranker bytes onto the 0.5..0.95 progress band. Update the job
+        # message with the byte figure so the ~2-min poll shows concrete progress.
+        if expected:
+            frac = min(received / expected, 1.0)
+        else:
+            frac = 0.0
+        pct = 50 + int(frac * 45)  # 50% .. 95%
+        mb = f"{received / 1048576:.0f}/{expected / 1048576:.0f} MB" if expected \
+            else f"{received / 1048576:.0f} MB"
+        _set(pct / 100.0, f"Downloading reranker weights: {mb}")
+
+    try:
+        rr = pipeline.reranker
+        if rr._model is not None or rr._load_error is not None:  # type: ignore[attr-defined]
+            _set(0.95, "Reranker already available/failed-skip")
+        else:
+            rr.ensure_downloaded(progress_callback=_reranker_cb)
+            _set(0.95, "Reranker weights ready")
+    except Exception as exc:
+        msg = f"Reranker weights download failed: {exc}"
+        log.error("Bootstrap %s: %s", job_id, msg)
+        errors.append(msg)
+
+    # --- Terminal state ------------------------------------------------------
+    if errors:
+        update_job(conn, job_id, status="ERROR", progress=0.95,
+                   message="Bootstrap failed: " + "; ".join(errors)[:400])
+    else:
+        update_job(conn, job_id, status="DONE", progress=1.0,
+                   message="Models ready: embedding + reranker cached locally")
+    log.info("Bootstrap job %s complete (errors=%d)", job_id, len(errors))
+
+
 # --------------------------------------------------------------------------- #
 # MCP Tools
 # --------------------------------------------------------------------------- #
+def _start_sync_job(pid: int, kind: str) -> dict:
+    """Create a full (non-incremental) sync job for ``pid`` and submit it.
+
+    Shared by ``init_jama_project`` (kind="init") and ``reinit_jama_project``
+    (kind="reinit"). Both re-fetch and re-index every item from scratch
+    (incremental=False). Enforces the reentrancy guard: if a job is already
+    RUNNING/PENDING for a project that is still INITIALIZING, hand back its
+    job_id instead of spawning a racing second worker (two concurrent syncs of
+    the same project race on upserts and can leave a split-brain terminal state
+    — one ERROR, one READY). A project already in a terminal state (READY/ERROR)
+    has a stale "zombie" job row, so a new sync is always allowed.
+
+    The check + create run under ``_init_lock``. (We can't wrap them in one
+    write_txn because create_job/upsert_project each open their own transaction;
+    SQLite forbids BEGIN within BEGIN. The lock is sufficient because there is a
+    single shared db() connection and a single writer at a time.)
+
+    Returns the immediate RUNNING response dict (caller returns it as-is), or an
+    ``{"error": ...}`` dict if the job could not be submitted.
+    """
+    conn = db()
+    with _init_lock:
+        proj = get_project(conn, pid)
+        proj_status = proj["status"] if proj else None
+        active = get_active_job_for_project(conn, pid)
+        if active is not None and proj_status == "INITIALIZING":
+            return {"job_id": active["job_id"], "project_id": pid,
+                    "status": "RUNNING",
+                    "note": f"A sync is already in progress for project "
+                            f"{pid}; reuse job_id {active['job_id']}"}
+        job_id = f"{kind}-{uuid.uuid4().hex[:12]}"
+        create_job(conn, job_id, pid, kind)
+        upsert_project(conn, pid, status="INITIALIZING")
+    # Submit outside the txn (the worker opens its own conn). If submission
+    # itself fails (executor shut down), roll back the job so the project
+    # isn't left stuck INITIALIZING with a phantom RUNNING job.
+    try:
+        _executor.submit(_run_job, pid, job_id, incremental=False)
+    except Exception as exc:
+        log.error("Could not submit %s job %s: %s", kind, job_id, exc)
+        try:
+            update_job(conn, job_id, status="ERROR",
+                       message=f"Submit failed: {exc}")
+            upsert_project(conn, pid, status="ERROR",
+                           error=f"Submit failed: {exc}")
+        except Exception:
+            pass
+        return {"error": f"Could not start sync job: {exc}"}
+    log.info("Started %s job %s for project %s", kind, job_id, pid)
+    return {"job_id": job_id, "project_id": pid, "status": "RUNNING"}
+
+
 @mcp.tool()
 def init_jama_project(project_id: str) -> dict:
     """Initialize a Jama project: download, clean, vectorize and index its items.
 
     Runs as an async background task and returns a job_id immediately so the
-    caller (LLM) is never blocked. Poll progress with get_sync_progress.
+    caller (LLM) is never blocked. Poll progress with get_sync_progress roughly
+    every 2 minutes until status is DONE or ERROR, reporting each sample to the
+    user. To re-index a project that is already initialized, prefer
+    reinit_jama_project.
 
     Args:
         project_id: Jama project id (numeric string, e.g. "20571").
@@ -467,53 +659,125 @@ def init_jama_project(project_id: str) -> dict:
         pid = int(project_id)
     except (TypeError, ValueError):
         return {"error": "project_id must be a numeric string"}
-    conn = db()
-    # Reentrancy guard: refuse a duplicate concurrent sync. If a job is already
-    # RUNNING/PENDING for a project that is still INITIALIZING, hand back its id
-    # instead of spawning a second _run_job thread — two concurrent syncs of the
-    # same project race on upserts and can leave a split-brain terminal state
-    # (one ERROR, one READY). If the project already reached a terminal state
-    # (READY/ERROR) the job row is stale (zombie) and re-init is allowed.
-    # The check + create run under a lock-protected critical section. (We can't
-    # wrap them in one write_txn because create_job/upsert_project each open
-    # their own transaction; SQLite forbids BEGIN within BEGIN. The lock is
-    # sufficient because there is a single shared db() connection and a single
-    # writer at a time.)
-    from db_setup import get_active_job_for_project
-    with _init_lock:
-        proj = get_project(conn, pid)
-        proj_status = proj["status"] if proj else None
-        active = get_active_job_for_project(conn, pid)
-        if active is not None and proj_status == "INITIALIZING":
-            return {"job_id": active["job_id"], "project_id": pid,
-                    "status": "RUNNING",
-                    "note": f"A sync is already in progress for project "
-                            f"{pid}; reuse job_id {active['job_id']}"}
-        job_id = f"init-{uuid.uuid4().hex[:12]}"
-        create_job(conn, job_id, pid, "init")
-        upsert_project(conn, pid, status="INITIALIZING")
-    # Submit outside the txn (the worker opens its own conn). If submission
-    # itself fails (executor shut down), roll back the job so the project
-    # isn't left stuck INITIALIZING with a phantom RUNNING job.
+    return _start_sync_job(pid, "init")
+
+
+@mcp.tool()
+def reinit_jama_project(project_id: str) -> dict:
+    """Re-initialize an already-initialized Jama project (full re-sync).
+
+    Behaves like init_jama_project but is the explicit verb for re-fetching and
+    re-indexing a project that has already reached READY/ERROR — e.g. after a
+    config change, corrupted index, or to pull a fresh full copy. Runs as an
+    async background task and returns a job_id immediately. Poll progress with
+    get_sync_progress roughly every 2 minutes until status is DONE or ERROR,
+    reporting each sample to the user.
+
+    Args:
+        project_id: Jama project id (numeric string, e.g. "20571").
+
+    Returns:
+        {"job_id": "...", "project_id": ..., "status": "RUNNING"}
+    """
+    not_ready = _ensure_ready({"jama", "embedding"})
+    if not_ready:
+        return not_ready
     try:
-        _executor.submit(_run_job, pid, job_id, incremental=False)
+        pid = int(project_id)
+    except (TypeError, ValueError):
+        return {"error": "project_id must be a numeric string"}
+    return _start_sync_job(pid, "reinit")
+
+
+# Bootstrap job id guard — only one model pre-download runs at a time.
+_bootstrap_lock = threading.Lock()
+_bootstrap_job_id: str | None = None
+
+
+@mcp.tool()
+def bootstrap_models() -> dict:
+    """Pre-download the embedding + reranker models so syncs never wait on them.
+
+    Downloads the local embedding model (bge-small-en-v1.5, ~67MB) and the
+    Qwen3-Reranker weights (~1.2GB) into the project-local cache, ASYNCHRONOUSLY.
+    Returns a job_id immediately. This is the recommended first step after
+    installing/configuring the server — call it BEFORE init_jama_project so the
+    first sync isn't slowed by model downloads. Models already cached are
+    skipped. Poll progress with get_bootstrap_progress roughly every 2 minutes,
+    reporting each sample to the user, until status is DONE or ERROR.
+
+    Returns:
+        {"job_id": "...", "status": "RUNNING"} or, if a bootstrap is already
+        running, {"job_id": "...", "status": "RUNNING", "note": "..."}.
+    """
+    not_ready = _ensure_ready(set())  # only needs storage + network, not Jama
+    if not_ready:
+        return not_ready
+    global _bootstrap_job_id
+    conn = db()
+    with _bootstrap_lock:
+        # Reentrancy: if a bootstrap job is still RUNNING, hand back its id
+        # instead of spawning a second download (two concurrent downloads of
+        # the same weights race on the cache files).
+        if _bootstrap_job_id is not None:
+            existing = get_job(conn, _bootstrap_job_id)
+            if existing and existing["status"] in ("PENDING", "RUNNING"):
+                return {"job_id": _bootstrap_job_id, "status": "RUNNING",
+                        "note": "A model bootstrap is already in progress; "
+                                f"reuse job_id {_bootstrap_job_id}"}
+        job_id = f"bootstrap-{uuid.uuid4().hex[:12]}"
+        create_job(conn, job_id, 0, "bootstrap")  # project_id=0 (no project)
+        _bootstrap_job_id = job_id
+    try:
+        _executor.submit(_run_bootstrap_job, job_id)
     except Exception as exc:
-        log.error("Could not submit init job %s: %s", job_id, exc)
+        log.error("Could not submit bootstrap job %s: %s", job_id, exc)
         try:
             update_job(conn, job_id, status="ERROR",
                        message=f"Submit failed: {exc}")
-            upsert_project(conn, pid, status="ERROR",
-                           error=f"Submit failed: {exc}")
         except Exception:
             pass
-        return {"error": f"Could not start sync job: {exc}"}
-    log.info("Started init job %s for project %s", job_id, pid)
-    return {"job_id": job_id, "project_id": pid, "status": "RUNNING"}
+        with _bootstrap_lock:
+            _bootstrap_job_id = None
+        return {"error": f"Could not start bootstrap job: {exc}"}
+    log.info("Started bootstrap job %s", job_id)
+    return {"job_id": job_id, "status": "RUNNING"}
+
+
+@mcp.tool()
+def get_bootstrap_progress(job_id: str) -> dict:
+    """Poll the progress of a bootstrap_models job.
+
+    After calling bootstrap_models, poll this roughly every 2 minutes, reporting
+    each sample (status, progress %, message with live download bytes) to the
+    user, until status is DONE or ERROR. The message field carries concrete
+    download progress (e.g. "Downloading reranker weights: 680/1200 MB") while
+    the job is running.
+
+    Returns:
+        {"job_id","project_id","kind","status","progress","total","done",
+         "message","started_at","finished_at"} (project_id is 0 for a
+        bootstrap job — it has no project). status is one of
+        PENDING | RUNNING | DONE | ERROR.
+    """
+    not_ready = _ensure_ready(set())
+    if not_ready:
+        return not_ready
+    conn = db()
+    row = get_job(conn, job_id)
+    if row is None:
+        return {"error": f"Unknown job_id: {job_id}"}
+    return _job_summary(row)
 
 
 @mcp.tool()
 def get_sync_progress(job_id: str) -> dict:
-    """Poll the progress of an init or sync job.
+    """Poll the progress of an init, reinit or sync job.
+
+    After calling init_jama_project or reinit_jama_project, poll this roughly
+    every 2 minutes until status is DONE or ERROR, reporting each sample to the
+    user. For a project-wide view of all operations and their last runs, use
+    get_sync_status instead.
 
     Returns:
         {"job_id","project_id","kind","status","progress","total","done",
@@ -527,6 +791,41 @@ def get_sync_progress(job_id: str) -> dict:
     row = get_job(conn, job_id)
     if row is None:
         return {"error": f"Unknown job_id: {job_id}"}
+    return _job_summary(row)
+
+
+def _process_metrics(pid: int, conn) -> dict | None:
+    """Lightweight live process + index metrics for the monitor.
+
+    Mirrors the sampling in ``monitor_lyra_init.py`` but reuses the shared
+    ``db()`` connection and scopes the chunk count to the requested project.
+    Returns ``None`` if psutil is unavailable or sampling fails, so the monitor
+    degrades gracefully instead of erroring the whole tool. cpu_pct is omitted
+    (it needs a baseline interval that would block the tool call).
+    """
+    try:
+        import psutil
+        proc = psutil.Process()
+        mem = proc.memory_info()
+        return {
+            "rss_mb": round(mem.rss / 1024 / 1024, 1),
+            "threads": proc.num_threads(),
+            "db_mb": round(os.path.getsize(settings.storage.db_path)
+                           / 1024 / 1024, 1),
+            "chunks": count_chunks(conn, pid),
+        }
+    except Exception:
+        return None
+
+
+def _job_summary(row) -> dict | None:
+    """Compact job dict for the monitor (None when there's no row).
+
+    Shared by get_sync_progress / get_bootstrap_progress / get_sync_status so
+    the job field shape stays consistent across all monitor tools.
+    """
+    if row is None:
+        return None
     return {
         "job_id": row["job_id"],
         "project_id": row["project_id"],
@@ -538,6 +837,56 @@ def get_sync_progress(job_id: str) -> dict:
         "message": row["message"],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
+    }
+
+
+@mcp.tool()
+def get_sync_status(project_id: str) -> dict:
+    """Monitor a project's sync operations: current run + last run of each kind.
+
+    Use this to check on init_jama_project / reinit_jama_project / scheduled
+    sync for one project. It returns the in-flight job (if any), the most recent
+    init / reinit / sync job (terminal or running), the project's current state,
+    and lightweight process metrics. After starting an init or reinit, you may
+    poll this roughly every 2 minutes (reporting each sample to the user) until
+    active_job is null and the relevant recent.* entry is DONE/ERROR.
+
+    Args:
+        project_id: Jama project id (numeric string, e.g. "20571").
+
+    Returns:
+        {"project_id","project_status","last_sync_time","item_count",
+         "chunk_count","active_job": {...}|null,
+         "recent": {"init": {...}|null, "reinit": {...}|null,
+                    "sync": {...}|null},
+         "process": {"rss_mb","threads","db_mb","chunks"}|null}
+        Returns {"error": ...} if the project_id is not numeric or the server
+        is not ready.
+    """
+    not_ready = _ensure_ready(set())  # always allowed, like get_sync_progress
+    if not_ready:
+        return not_ready
+    try:
+        pid = int(project_id)
+    except (TypeError, ValueError):
+        return {"error": "project_id must be a numeric string"}
+    conn = db()
+    proj = get_project(conn, pid)
+    proj_status = proj["status"] if proj else "NEW"
+    return {
+        "project_id": pid,
+        "project_status": proj_status,
+        "last_sync_time": proj["last_sync_time"] if proj else None,
+        "item_count": proj["item_count"] if proj else 0,
+        "chunk_count": proj["chunk_count"] if proj else 0,
+        "active_job": _job_summary(get_active_job_for_project(conn, pid)),
+        "recent": {
+            "init": _job_summary(get_latest_job_for_project(conn, pid, "init")),
+            "reinit": _job_summary(
+                get_latest_job_for_project(conn, pid, "reinit")),
+            "sync": _job_summary(get_latest_job_for_project(conn, pid, "sync")),
+        },
+        "process": _process_metrics(pid, conn),
     }
 
 
@@ -1221,7 +1570,20 @@ def configure_jama(values: dict) -> dict:
 # APScheduler incremental sync
 # --------------------------------------------------------------------------- #
 def _incremental_sync_all() -> None:
-    """Sync every initialized project for newly-modified items."""
+    """Sync every initialized project for newly-modified items (async).
+
+    Each project's sync is submitted to the shared ``_executor`` thread pool
+    (like init/reinit) so this scheduler tick returns immediately instead of
+    blocking the scheduler thread for the whole batch. The per-project
+    ``_project_lock`` still serializes a scheduled sync against any concurrent
+    user-initiated sync for the same project.
+
+    A project that already has an in-flight job is skipped: submitting another
+    would just queue behind the per-project lock and occupy a worker slot, and
+    the next scheduled tick will pick up any newer modifications. The check +
+    create run under ``_init_lock`` to avoid a TOCTOU with a concurrent
+    init/reinit (same pattern as ``_start_sync_job``).
+    """
     conn = db()
     projects = list_initialized_projects(conn)
     if not projects:
@@ -1229,12 +1591,26 @@ def _incremental_sync_all() -> None:
     log.info("Incremental sync: %s project(s)", len(projects))
     for p in projects:
         pid = p["project_id"]
-        job_id = f"sync-{uuid.uuid4().hex[:12]}"
+        with _init_lock:
+            if get_active_job_for_project(conn, pid) is not None:
+                log.info("Skip scheduled sync for project %s: a job is "
+                         "already in flight", pid)
+                continue
+            job_id = f"sync-{uuid.uuid4().hex[:12]}"
+            try:
+                create_job(conn, job_id, pid, "sync")
+            except Exception as exc:
+                log.error("Could not create sync job for %s: %s", pid, exc)
+                continue
         try:
-            create_job(conn, job_id, pid, "sync")
-            _run_job(pid, job_id, incremental=True)
+            _executor.submit(_run_job, pid, job_id, incremental=True)
         except Exception as exc:
-            log.error("Incremental sync failed for %s: %s", pid, exc)
+            log.error("Could not submit sync job for %s: %s", pid, exc)
+            try:
+                update_job(conn, job_id, status="ERROR",
+                           message=f"Submit failed: {exc}")
+            except Exception:
+                pass
 
 
 def _start_scheduler() -> BackgroundScheduler | None:
@@ -1283,12 +1659,48 @@ def _resume_interrupted_syncs() -> None:
         _executor.submit(_run_job, pid, job_id, incremental=False)
 
 
+def _warn_if_models_missing() -> None:
+    """Log a clear hint if the embedding/reranker models aren't cached yet.
+
+    Uses the lightweight on-disk presence checks (no model load) so startup
+    stays fast. Doesn't block or auto-download — just nudges the user/LLM to
+    call `bootstrap_models` so the first sync isn't slowed by a download.
+    """
+    missing = []
+    try:
+        pipeline = rag()
+        # Embedding: only the local provider downloads a model; azure hits an
+        # API endpoint, so there's nothing to cache.
+        if settings.embedding.provider == "local":
+            if not pipeline.embedder._model_present():  # type: ignore[attr-defined]
+                missing.append("embedding (bge-small-en-v1.5)")
+        # Reranker: lightweight on-disk check (no load, no network).
+        if not pipeline.reranker.weights_cached():
+            missing.append("reranker (Qwen3-Reranker-0.6B)")
+    except Exception:
+        return  # don't let a probe failure noise up startup
+    if missing:
+        log.warning("Models not yet cached: %s. Call the `bootstrap_models` MCP "
+                    "tool to pre-download them (poll get_bootstrap_progress "
+                    "every ~2 min) BEFORE the first init_jama_project.",
+                    ", ".join(missing))
+
+
 def main() -> None:
     # Eagerly initialize the DB so schema/extension errors surface at startup.
     init_db()
+    # Clear crash-leftover RUNNING jobs before any worker runs, so the monitor
+    # never reports a phantom in-flight job. Must precede _resume_interrupted_syncs
+    # so resumed INITIALIZING projects get a fresh job row rather than reusing a
+    # now-stale one.
+    reconciled = reconcile_stale_jobs(db())
+    if reconciled:
+        log.info("Reconciled %s stale job(s) left RUNNING by a prior crash",
+                 reconciled)
     # Recover any project interrupted mid-sync by a prior crash before serving.
     _resume_interrupted_syncs()
     _start_scheduler()
+    _warn_if_models_missing()
     log.info("Jama MCP Server starting (stdio)...")
     mcp.run(transport="stdio")
 

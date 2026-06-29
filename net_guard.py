@@ -104,7 +104,8 @@ def speed_test(url: str, *, min_bytes_per_sec: int, timeout: int,
 def download_with_retry(url: str, dest: str, *, min_bytes_per_sec: int,
                         max_retries: int = 4, chunk_timeout: float = 30.0,
                         headers: dict | None = None,
-                        label: str = "download") -> str:
+                        label: str = "download",
+                        progress_callback=None) -> str:
     """Download ``url`` to ``dest`` with resume + stall retry.
 
     Resumes from the existing partial file (byte offset) on each attempt. If
@@ -112,6 +113,12 @@ def download_with_retry(url: str, dest: str, *, min_bytes_per_sec: int,
     network error occurs, the attempt is aborted and retried (up to
     ``max_retries``). Raises ``NetworkTooSlowError`` only if all retries are
     exhausted due to sustained stalls.
+
+    ``progress_callback``, if given, is invoked as
+    ``progress_callback(received, expected)`` after each chunk is written, where
+    ``received`` is total bytes on disk so far and ``expected`` is the
+    Content-Length (or ``None`` if unknown). Used by the bootstrap monitor to
+    report live download progress roughly every 2 minutes.
     """
     sess = _session()
     os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
@@ -148,6 +155,11 @@ def download_with_retry(url: str, dest: str, *, min_bytes_per_sec: int,
                             continue
                         f.write(chunk)
                         received += len(chunk)
+                        if progress_callback is not None:
+                            try:
+                                progress_callback(received, expected)
+                            except Exception:
+                                pass  # monitor callback must never break download
                         now = time.monotonic()
                         # Stall guard: measure speed over a rolling window.
                         window = now - last_window_time

@@ -32,6 +32,10 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 # Only set if the caller hasn't already configured HF_HOME/HUGGINGFACE_HUB_CACHE.
 os.environ.setdefault("HF_HOME", str(USER_DIR / "huggingface"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(USER_DIR / "huggingface" / "hub"))
+# Disable HF's Xet transfer protocol. fastembed pulls the ONNX model via
+# huggingface_hub, which defaults to the Xet protocol; on some networks it
+# fails mid-transfer. Forcing the plain HTTPS path avoids the failure.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 # Once weights are cached we prefer offline mode so transient network errors
 # never block reranker loading in production.
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "0")

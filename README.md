@@ -107,6 +107,11 @@ python setup_wizard.py --self-test
 python server.py
 ```
 
+After the server starts, the LLM client should call `bootstrap_models` (and poll
+`get_bootstrap_progress` every ~2 min) to pre-download the embedding + reranker
+models BEFORE the first `init_jama_project` — see [Model bootstrap](#model-bootstrap).
+On startup the server logs a hint if the models aren't cached yet.
+
 ### First-run configuration guard
 
 Every MCP tool runs an offline **pre-flight check** before doing any work:
@@ -132,10 +137,65 @@ wizard, or call the `configure_jama` / `validate_setup` tools at runtime.
 
 ## Usage flow (for the LLM)
 
+0. `bootstrap_models()` → pre-download embedding + reranker models (first run
+   only). Returns `job_id` immediately; poll `get_bootstrap_progress(job_id)`
+   every ~2 min until `DONE`. Skip if models are already cached (re-running is
+   a fast no-op).
 1. `init_jama_project("20571")` → returns `job_id` immediately (non-blocking).
-2. `get_sync_progress(job_id)` → poll until `status == "DONE"`.
+2. `get_sync_progress(job_id)` → poll until `status == "DONE"`, roughly every
+   2 minutes (syncs index many items and take minutes — don't busy-poll).
 3. `search_jama_semantics("20571", "how does volume sync work", top_k=5)` → RAG.
 4. `query_jama_native_metadata("20314", document_key="SA-TC-7")` → exact match.
+
+To re-index a project that is already initialized, use
+`reinit_jama_project("20571")` (full re-sync) and poll the same way. Scheduled
+incremental syncs run automatically (~every 2h); check any project's in-flight
+job plus its last init/reinit/sync run at any time with
+`get_sync_status("20571")`.
+
+## Model bootstrap
+
+The embedding model (~67MB, bge-small-en-v1.5) and Qwen3 reranker weights
+(~1.2GB) are **not bundled** — they download on first use. To keep the first
+sync from stalling on a model download, call `bootstrap_models` right after the
+server is configured. It downloads BOTH models **asynchronously** (a
+`kind="bootstrap"` job in `sync_jobs`, run on the same thread pool as syncs) and
+returns a `job_id` immediately.
+
+- `bootstrap_models()` — start the async pre-download (no-op per model if
+  already cached). Reentrancy-guarded: a second call while one is RUNNING
+  returns the existing `job_id`.
+- `get_bootstrap_progress(job_id)` — poll every ~2 min. While the 1.2GB reranker
+  downloads, `message` carries live byte progress
+  (e.g. `"Downloading reranker weights: 680/1200 MB"`); the ~67MB embedding
+  model downloads via fastembed (no byte callback) so it reports phase
+  transitions only. `status` → `DONE` (both cached) or `ERROR`.
+
+On startup, if either model isn't cached, the server logs a hint to call
+`bootstrap_models`. The sync-time `ensure_downloaded` calls remain as a fallback
+so a skipped bootstrap still works (the first sync downloads the models inline).
+
+## Monitoring
+
+`get_sync_status(project_id)` is the one-call monitor for a project's sync
+operations. All three operations — `init_jama_project`, `reinit_jama_project`
+and the scheduled incremental sync — run **asynchronously** as background jobs
+(recorded in the `sync_jobs` table with `kind` = `init` / `reinit` / `sync`),
+so each is pollable. The tool returns:
+
+- `active_job` — the in-flight job for this project (or `null` if idle);
+- `recent.{init,reinit,sync}` — the most recent job of each kind, terminal or
+  running, so you can see the last result even when nothing is running now;
+- `project_status` / `last_sync_time` / `item_count` / `chunk_count` — current
+  project state;
+- `process` — lightweight live metrics (RSS, threads, DB size, chunk count) for
+  the server process; `null` if `psutil` is unavailable.
+
+After starting an init or reinit, poll `get_sync_progress(job_id)` (or
+`get_sync_status(project_id)`) roughly every 2 minutes, reporting each sample
+to the user, until the job reaches `DONE`/`ERROR`. On startup, any job left
+`RUNNING` by a prior crash is reconciled to `ERROR (interrupted by restart)`
+so the monitor never shows a phantom in-flight job.
 
 ## Resilience
 
@@ -185,9 +245,13 @@ wizard, or call the `configure_jama` / `validate_setup` tools at runtime.
 - `list_jama_item_types()` — tenant item types (id → name).
 - `query_jama_endpoint(path, params?, all_pages?)` — generic read-only GET escape hatch.
 
-**RAG / retrieval**
+**RAG / retrieval / sync monitoring**
+- `bootstrap_models()` — async pre-download of embedding + reranker models (returns `job_id`).
+- `get_bootstrap_progress(job_id)` — poll a bootstrap job (every ~2 min) until DONE/ERROR.
 - `init_jama_project(project_id)` — async background init (returns `job_id`).
-- `get_sync_progress(job_id)` — poll init/sync progress.
+- `reinit_jama_project(project_id)` — async full re-sync of an already-initialized project.
+- `get_sync_progress(job_id)` — poll one init/reinit/sync job's progress.
+- `get_sync_status(project_id)` — project monitor: in-flight job + last init/reinit/sync run + process metrics.
 - `search_jama_semantics(project_id, query, ...)` — Multi-Query + hybrid + RRF + Qwen3 rerank.
 - `query_jama_native_metadata(project_id, ...)` — exact-match metadata via `/abstractitems`.
 

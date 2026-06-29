@@ -395,7 +395,9 @@ def test_mcp_tools_registered() -> None:
         return
     # FastMCP exposes registered tools via the tool manager.
     expected = {
-        "init_jama_project", "get_sync_progress", "search_jama_semantics",
+        "bootstrap_models", "get_bootstrap_progress",
+        "init_jama_project", "reinit_jama_project", "get_sync_progress",
+        "get_sync_status", "search_jama_semantics",
         "query_jama_native_metadata", "list_jama_projects", "get_jama_item",
         "get_jama_item_relationships", "get_jama_item_children",
         "list_jama_project_relationships",

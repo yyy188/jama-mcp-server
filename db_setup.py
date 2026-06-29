@@ -145,7 +145,7 @@ CREATE INDEX IF NOT EXISTS idx_chunks_modified ON chunks(project_id, modified_da
 CREATE TABLE IF NOT EXISTS sync_jobs (
     job_id       TEXT PRIMARY KEY,
     project_id   INTEGER,
-    kind         TEXT,                          -- "init" | "sync"
+    kind         TEXT,                          -- "init" | "reinit" | "sync"
     status       TEXT DEFAULT 'PENDING',        -- PENDING|RUNNING|DONE|ERROR
     progress     REAL DEFAULT 0.0,              -- 0.0 .. 1.0
     total        INTEGER DEFAULT 0,
@@ -503,3 +503,48 @@ def get_active_job_for_project(conn: sqlite3.Connection,
         "('PENDING','RUNNING') ORDER BY started_at DESC LIMIT 1",
         (project_id,)
     ).fetchone()
+
+
+def get_latest_job_for_project(conn: sqlite3.Connection, project_id: int,
+                               kind: str | None = None) -> sqlite3.Row | None:
+    """Most recent job of a given kind for a project (terminal or in-flight).
+
+    Unlike :func:`get_active_job_for_project` (which only finds non-terminal
+    jobs), this returns the latest job row regardless of status — used by the
+    ``get_sync_status`` monitor to report each operation's last run. Pass
+    ``kind`` to scope to ``"init"`` / ``"reinit"`` / ``"sync"``; ``None`` returns
+    the latest job of any kind.
+    """
+    if kind:
+        return conn.execute(
+            "SELECT * FROM sync_jobs WHERE project_id=? AND kind=? "
+            "ORDER BY started_at DESC LIMIT 1",
+            (project_id, kind)
+        ).fetchone()
+    return conn.execute(
+        "SELECT * FROM sync_jobs WHERE project_id=? "
+        "ORDER BY started_at DESC LIMIT 1",
+        (project_id,)
+    ).fetchone()
+
+
+def reconcile_stale_jobs(conn: sqlite3.Connection) -> int:
+    """Mark every PENDING/RUNNING job as ERROR (interrupted by restart).
+
+    Called once at startup, before any worker thread is running, so any
+    non-terminal job row is a crash leftover from a prior process — its worker
+    is gone and will never advance it. Without this, ``get_active_job_for_project``
+    would forever report a phantom RUNNING job and the monitor would look stuck.
+
+    Returns the number of rows reconciled. Project-level recovery (re-queuing
+    INITIALIZING projects) is handled separately by ``_resume_interrupted_syncs``
+    in server.py; a reconciled ``sync`` job belongs to a READY project that the
+    next scheduled tick will catch up.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE sync_jobs SET status='ERROR', "
+            "message=COALESCE(message,'')||' [interrupted by restart]', "
+            "finished_at=datetime('now') WHERE status IN ('PENDING','RUNNING')"
+        )
+    return cur.rowcount
