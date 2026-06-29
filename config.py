@@ -22,13 +22,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 USER_DIR = PROJECT_ROOT / "user"
 USER_DIR.mkdir(parents=True, exist_ok=True)
 
-# Use the HuggingFace China mirror by default so model weights (e.g.
-# Qwen3-Reranker-0.6B) can be downloaded from inside mainland China. This is
-# read by huggingface_hub / transformers when fetching models. Override with
-# HF_ENDPOINT in the environment if a different mirror is preferred.
+# Use the HuggingFace China mirror by default so model weights (the ~80MB
+# cross-encoder reranker + ~67MB embedding model) can be downloaded from inside
+# mainland China. This is read by huggingface_hub / transformers when fetching
+# models. Override with HF_ENDPOINT in the environment if a different mirror is
+# preferred.
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 # Default the HF cache to a project-local folder (user/huggingface) so the
-# 1.2GB reranker weights live inside the project, not in the user home dir.
+# reranker weights live inside the project, not in the user home dir.
 # Only set if the caller hasn't already configured HF_HOME/HUGGINGFACE_HUB_CACHE.
 os.environ.setdefault("HF_HOME", str(USER_DIR / "huggingface"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(USER_DIR / "huggingface" / "hub"))
@@ -143,31 +144,28 @@ class EmbeddingSettings:
 
 @dataclass(frozen=True)
 class RerankerSettings:
-    """Local Qwen3-Reranker-0.6B (CPU)."""
-    model_name: str = _get("RERANKER_MODEL", "Qwen/Qwen3-Reranker-0.6B")
-    # Max candidate pairs scored in one forward pass (memory bound). The Qwen3
-    # reranker is a full causal LM (vocab ~152k); each batch of N×max_length
-    # tokens produces an [N, max_length, vocab] logits tensor. At batch=16,
-    # max_length=512 that single tensor is ~5 GB (fp32) — the prior OOM cause.
-    # batch=4 keeps the peak well under 1 GB while staying fast enough.
-    batch_size: int = _get_int("RERANKER_BATCH_SIZE", 4)
-    # 256 is ample for (query + chunk) relevance; 512 doubled memory for no
-    # recall gain since chunks are already capped at chunk_size in indexing.
+    """Local cross-encoder reranker (CPU).
+
+    Default: ``cross-encoder/ms-marco-MiniLM-L-6-v2`` (~80MB, 6-layer MiniLM).
+    Much smaller than the prior Qwen3-Reranker-0.6B (1.2GB) while giving
+    comparable precision for the top-25 candidate re-ranking this server does
+    (RRF already fuses recall; the reranker only re-sorts the final 25). A
+    cross-encoder scores (query, document) pairs directly via a sequence-
+    classification head — no causal-LM prompt format, no 152k-vocab logits tensor.
+    """
+    model_name: str = _get("RERANKER_MODEL",
+                           "cross-encoder/ms-marco-MiniLM-L-6-v2")
+    # Max (query, doc) pairs scored in one forward pass. MiniLM is tiny (~80MB,
+    # 6 layers); batch=16 stays well under 1 GB and keeps re-ranking 25
+    # candidates fast on CPU. (The old Qwen3 causal-LM needed batch=4 because of
+    # its [N, seq, 152k-vocab] logits tensor; a cross-encoder has no such tensor.)
+    batch_size: int = _get_int("RERANKER_BATCH_SIZE", 16)
+    # 256 is ample for (query + chunk) relevance; chunks are already capped at
+    # chunk_size during indexing.
     max_length: int = _get_int("RERANKER_MAX_LENGTH", 256)
     # If model loading fails, degrade to RRF-only scoring instead of crashing.
     allow_fallback: bool = _get("RERANKER_ALLOW_FALLBACK", "1") == "1"
     device: str = _get("RERANKER_DEVICE", "cpu")
-    # Pre-flight speed test before pulling weights from the HF mirror.
-    hf_min_bytes_per_sec: int = _get_int("HF_MIN_BYTES_PER_SEC", 200_000)
-    hf_speed_test_timeout: int = _get_int("HF_SPEED_TEST_TIMEOUT", 20)
-    hf_download_retries: int = _get_int("HF_DOWNLOAD_RETRIES", 4)
-    device: str = _get("RERANKER_DEVICE", "cpu")
-    # Pre-flight speed test before pulling model weights from HuggingFace.
-    # If the HF mirror is slower than this (bytes/sec), abort with a network
-    # error instead of hanging for hours on a stalled download.
-    hf_min_bytes_per_sec: int = _get_int("RERANKER_HF_MIN_BYTES_PER_SEC", 200_000)
-    hf_speed_test_timeout: int = _get_int("RERANKER_HF_SPEED_TEST_TIMEOUT", 20)
-    hf_max_retries: int = _get_int("RERANKER_HF_MAX_RETRIES", 5)
 
 
 @dataclass(frozen=True)

@@ -16,7 +16,7 @@ between semantic search and structured metadata queries.
             │   server.py  (FastMCP + APScheduler + thread pool)          │
             │      │                                                       │
             │      ├── rag_pipeline.py  (Multi-Query + Hybrid + RRF +     │
-            │      │                       Qwen3-Reranker)                 │
+            │      │                       cross-encoder reranker)         │
             │      ├── jama_client.py   (OAuth2 + pagination + HTML clean)│
             │      └── db_setup.py      (SQLite + FTS5 + sqlite-vec)      │
             │                                                              │
@@ -38,11 +38,12 @@ between semantic search and structured metadata queries.
    + keyword recall (FTS5, BM25), each capped at `candidate_k`.
 3. **RRF fusion** — Reciprocal Rank Fusion merges all ranked lists into one
    candidate pool of ≤ `candidate_k` unique chunks.
-4. **Rerank** — local **Qwen3-Reranker-0.6B** (CPU, via `transformers`) scores
-   `(query, chunk)` pairs via the `P("yes")` token probability; top `top_k`
-   returned. If the model is unavailable, the pipeline gracefully falls back to
-   RRF scores. Model weights are fetched from the HuggingFace China mirror
-   (`HF_ENDPOINT=https://hf-mirror.com`) on first use, then served from cache.
+4. **Rerank** — a local **cross-encoder** (`cross-encoder/ms-marco-MiniLM-L-6-v2`,
+   ~80MB, CPU, via `transformers`) scores `(query, chunk)` pairs via a sequence-
+   classification head; top `top_k` returned. If the model is unavailable, the
+   pipeline gracefully falls back to RRF scores. Model weights are fetched from
+   the HuggingFace China mirror (`HF_ENDPOINT=https://hf-mirror.com`) on first
+   use, then served from cache.
 
 ## Reliability & crash recovery
 
@@ -96,16 +97,45 @@ their old chunks replaced atomically.
 ## Setup
 
 ```bash
-# 1. Install (uses Aliyun mirror; GitHub-only deps fall back to PyPI)
+# 1. Install (uses Aliyun mirror; torch CPU build from the PyTorch CPU index)
 pip install -r requirements.txt
 
-# 2. Configure (interactive wizard writes .env, then validates deps + config,
-#    and optionally probes Jama/embedding connectivity with --self-test)
+# 2. Configure + pre-download models (the wizard writes .env, validates deps +
+#    config, probes connectivity with --self-test, AND downloads the embedding +
+#    reranker models so the first sync isn't slow). Use --skip-models to defer.
 python setup_wizard.py --self-test
 
 # 3. Run (stdio transport for an MCP client)
 python server.py
 ```
+
+To (re)download just the models later without re-running the wizard:
+
+```bash
+python bootstrap.py
+```
+
+The models live in `user/huggingface/` (project-local, ~150MB total: a 67MB
+embedding + 80MB cross-encoder reranker). They're plain data files — portable
+across machines, so you can also copy that folder from another machine to skip
+the download entirely.
+
+### Why pinned torch / onnxruntime versions
+
+`requirements.txt` pins **`torch==2.6.0+cpu`** (from the PyTorch CPU index) and
+**`onnxruntime==1.20.1`** (or `1.21.1` on Python 3.13+) on purpose:
+
+- The default CUDA `torch` from the Aliyun mirror is ~6 GB and depends on a new
+  VC++ Runtime (`vcruntime140_1.dll`) absent on many Windows machines, causing
+  `WinError 1114` DLL load failures. The CPU build (~200 MB) has no such
+  dependency and is all a 0.6B CPU reranker needs.
+- `onnxruntime` 1.27.0 (what `fastembed` pulls on Python 3.13+) triggers the
+  same VC++ DLL issue on Windows. 1.20.1 satisfies `fastembed`'s constraint on
+  Python 3.10–3.12 (`>=1.17.0, !=1.20.0`) and loads cleanly; Python 3.13+ needs
+  `>1.21`, so it's pinned to 1.21.1 there.
+
+If you upgrade these, re-test on a clean Windows machine **without** the latest
+VC++ Redistributable installed.
 
 After the server starts, the LLM client should call `bootstrap_models` (and poll
 `get_bootstrap_progress` every ~2 min) to pre-download the embedding + reranker
@@ -155,7 +185,7 @@ job plus its last init/reinit/sync run at any time with
 
 ## Model bootstrap
 
-The embedding model (~67MB, bge-small-en-v1.5) and Qwen3 reranker weights
+The embedding model (~67MB, bge-small-en-v1.5) and the cross-encoder reranker
 (~1.2GB) are **not bundled** — they download on first use. To keep the first
 sync from stalling on a model download, call `bootstrap_models` right after the
 server is configured. It downloads BOTH models **asynchronously** (a
@@ -252,7 +282,7 @@ so the monitor never shows a phantom in-flight job.
 - `reinit_jama_project(project_id)` — async full re-sync of an already-initialized project.
 - `get_sync_progress(job_id)` — poll one init/reinit/sync job's progress.
 - `get_sync_status(project_id)` — project monitor: in-flight job + last init/reinit/sync run + process metrics.
-- `search_jama_semantics(project_id, query, ...)` — Multi-Query + hybrid + RRF + Qwen3 rerank.
+- `search_jama_semantics(project_id, query, ...)` — Multi-Query + hybrid + RRF + cross-encoder rerank.
 - `query_jama_native_metadata(project_id, ...)` — exact-match metadata via `/abstractitems`.
 
 ## Verified
@@ -264,8 +294,8 @@ progress polling, incremental sync (0 new items), native metadata filters
 (item_type / status / keyword / document_key), APScheduler startup, MCP stdio
 handshake, and error paths (bad project id, unknown job, nonexistent project).
 
-The **Qwen3-Reranker-0.6B** was downloaded from the HuggingFace China mirror
-(`hf-mirror.com`) and loaded on CPU; verified it produces non-zero relevance
+The **cross-encoder reranker** (ms-marco-MiniLM-L-6-v2) was downloaded from the
+HuggingFace China mirror (`hf-mirror.com`) and loaded on CPU; verified it produces non-zero relevance
 scores with correct ordering (related=0.55 > unrelated=0.0002) and that the
 end-to-end RAG search returns `strategy=rerank` results. **LlamaIndex** is the
 primary RAG framework: `SentenceSplitter` + `Document`/`TextNode` for chunking.

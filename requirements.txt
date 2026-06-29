@@ -35,7 +35,24 @@ fastembed>=0.3.0
 
 # --- Local Qwen3-Reranker-0.6B (CPU) ---
 transformers>=4.44.0
-torch>=2.2.0
+# torch: pin to the CPU-only build from the PyTorch CPU index. The default
+# (CUDA) build from the Aliyun mirror is ~6GB and depends on a new VC++ Runtime
+# (vcruntime140_1.dll) that is absent on many Windows machines, causing
+# WinError 1114 DLL load failures. The CPU build (~200MB) has no such
+# dependency and is all a 0.6B CPU reranker needs. The "+cpu" local version
+# marker forces pip to pick THIS wheel, not the CUDA one from the main index.
+# PyTorch CPU index (reachable from CN, though slower than Aliyun):
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
+# onnxruntime: pin to a version whose Windows DLLs don't require the new VC++
+# Runtime. fastembed's constraint is Python-version-dependent:
+#   py3.10-3.12 -> >=1.17.0, !=1.20.0   (1.20.1 is allowed and stable)
+#   py3.13+     -> >1.21.0              (must use a newer build)
+# 1.27.0 (what fastembed 0.8.0 pulls on py3.13) triggers the same VC++ DLL
+# failure as CUDA torch on Windows, so for py3.13+ we pin 1.21.1 (the lowest
+# satisfying >1.21) instead of letting it float.
+onnxruntime==1.20.1; python_version < "3.13"
+onnxruntime==1.21.1; python_version >= "3.13"
 
 # --- Background incremental sync scheduler ---
 APScheduler>=3.10.0

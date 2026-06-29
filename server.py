@@ -93,7 +93,7 @@ Jama MCP — tool selection guide (read before choosing a tool)
 DEFAULT TO FUSION SEARCH. For any question that is not a precise lookup,
 call `search_jama_semantics`. It already fuses three retrieval signals in
 one call — keyword (FTS5/BM25), vector (sqlite-vec cosine) and RRF — then
-reranks with a local Qwen3 model. So "like", "keyword" and "semantic"
+reranks with a local cross-encoder model. So "like", "keyword" and "semantic"
 queries are ALL best answered by this single tool. Use it for:
   • natural-language questions      ("how does volume sync work")
   • partial / fuzzy matches         ("something about login timeout")
@@ -126,7 +126,7 @@ the rerank reference). This maximizes recall for RRF fusion and is
 preferred over letting the server fall back to lexical variants.
 
 MODEL BOOTSTRAP (first-run, before any init). The embedding model (~67MB)
-and Qwen3 reranker weights (~1.2GB) are NOT bundled — they download on first
+and cross-encoder reranker (~80MB) are NOT bundled — they download on first
 use. Call `bootstrap_models()` right after the server is configured: it
 downloads BOTH models asynchronously and returns a job_id immediately, so the
 first sync isn't slowed by a download and a download failure surfaces here
@@ -508,12 +508,13 @@ def _run_bootstrap_job(job_id: str) -> None:
 
     Reports live progress into the ``sync_jobs`` row (kind="bootstrap") so
     ``get_bootstrap_progress`` can be polled every ~2 min. The reranker
-    download (1.2 GB, our own ``download_with_retry``) feeds a real
-    received/expected byte callback; the embedding download (67 MB, fastembed
-    black box) only reports phase transitions (downloading -> ready) since
-    fastembed exposes no byte callback. Either model already cached skips its
-    download. Failures are non-fatal per-model (marked in the message) but the
-    job still ends ERROR if any model is missing at the end.
+    (~80MB cross-encoder) downloads via ``snapshot_download``, which gives no
+    per-chunk byte callback — so progress is reported as phase transitions
+    (downloading -> ready), not live bytes. The embedding model (~67MB) goes
+    through fastembed (also no byte callback), likewise phase-only. Either
+    model already cached skips its download. Failures are non-fatal per-model
+    (marked in the message) but the job still ends ERROR if any model is
+    missing at the end.
     """
     conn = db()
 
@@ -529,7 +530,8 @@ def _run_bootstrap_job(job_id: str) -> None:
 
     # --- Phase 1: embedding model (local only; azure needs no download) ------
     if provider == "local":
-        _set(0.1, "Checking/downloading embedding model (bge-small-en-v1.5, ~67MB)")
+        _set(0.1, f"Checking/downloading embedding model "
+                  f"({settings.embedding.local_model}, ~67MB)")
         emb = pipeline.embedder
         try:
             if emb._model_present():  # type: ignore[attr-defined]
@@ -544,20 +546,16 @@ def _run_bootstrap_job(job_id: str) -> None:
     else:
         _set(0.45, f"Embedding provider is {provider} (no model to download)")
 
-    # --- Phase 2: reranker weights (download_with_retry, real byte progress) -
-    _set(0.5, "Checking/downloading reranker weights (Qwen3-Reranker-0.6B, ~1.2GB)")
+    # --- Phase 2: reranker model (snapshot_download, no byte-level progress) --
+    # snapshot_download (used by ensure_downloaded) gives no per-chunk callback,
+    # so we can't show live bytes — only phase transitions. The progress band
+    # 0.5..0.95 is held at 0.5 while downloading, then jumps to 0.95 on success.
+    _set(0.5, f"Downloading reranker model ({settings.reranker.model_name}, ~80MB)")
 
     def _reranker_cb(received: int, expected: int | None) -> None:
-        # Map reranker bytes onto the 0.5..0.95 progress band. Update the job
-        # message with the byte figure so the ~2-min poll shows concrete progress.
-        if expected:
-            frac = min(received / expected, 1.0)
-        else:
-            frac = 0.0
-        pct = 50 + int(frac * 45)  # 50% .. 95%
-        mb = f"{received / 1048576:.0f}/{expected / 1048576:.0f} MB" if expected \
-            else f"{received / 1048576:.0f} MB"
-        _set(pct / 100.0, f"Downloading reranker weights: {mb}")
+        # Called once at completion by _ensure_weights_downloaded (snapshot_download
+        # has no byte callback). Advance to 0.95 so the monitor sees movement.
+        _set(0.95, "Reranker model downloaded")
 
     try:
         rr = pipeline.reranker
@@ -565,9 +563,9 @@ def _run_bootstrap_job(job_id: str) -> None:
             _set(0.95, "Reranker already available/failed-skip")
         else:
             rr.ensure_downloaded(progress_callback=_reranker_cb)
-            _set(0.95, "Reranker weights ready")
+            _set(0.95, "Reranker model ready")
     except Exception as exc:
-        msg = f"Reranker weights download failed: {exc}"
+        msg = f"Reranker model download failed: {exc}"
         log.error("Bootstrap %s: %s", job_id, msg)
         errors.append(msg)
 
@@ -699,7 +697,8 @@ def bootstrap_models() -> dict:
     """Pre-download the embedding + reranker models so syncs never wait on them.
 
     Downloads the local embedding model (bge-small-en-v1.5, ~67MB) and the
-    Qwen3-Reranker weights (~1.2GB) into the project-local cache, ASYNCHRONOUSLY.
+    cross-encoder reranker (cross-encoder/ms-marco-MiniLM-L-6-v2, ~80MB) into the
+    project-local cache, ASYNCHRONOUSLY.
     Returns a job_id immediately. This is the recommended first step after
     installing/configuring the server — call it BEFORE init_jama_project so the
     first sync isn't slowed by model downloads. Models already cached are
@@ -901,12 +900,12 @@ def search_jama_semantics(project_id: str, query: str,
 
     This is the DEFAULT tool for any non-precise question. It fuses keyword
     (FTS5/BM25), vector (sqlite-vec cosine) and RRF in one call, then reranks
-    with a local Qwen3 model — so "like", "keyword" and "semantic" queries are
+    with a local cross-encoder model — so "like", "keyword" and "semantic" queries are
     all best answered here. Prefer it over native metadata unless the user
     gives an exact document key / status / item id.
 
     Pipeline: client Multi-Query expansion -> hybrid recall (sqlite-vec +
-    FTS5) -> RRF fusion -> local Qwen3-Reranker-0.6B -> top_k results.
+    FTS5) -> RRF fusion -> local cross-encoder reranker -> top_k results.
 
     Args:
         project_id: numeric string Jama project id (must be initialized first).
@@ -1676,7 +1675,7 @@ def _warn_if_models_missing() -> None:
                 missing.append("embedding (bge-small-en-v1.5)")
         # Reranker: lightweight on-disk check (no load, no network).
         if not pipeline.reranker.weights_cached():
-            missing.append("reranker (Qwen3-Reranker-0.6B)")
+            missing.append(f"reranker ({settings.reranker.model_name})")
     except Exception:
         return  # don't let a probe failure noise up startup
     if missing:

@@ -34,8 +34,8 @@ _CORE_DEPS = [
 _OPTIONAL_DEPS = [
     ("mcp", "MCP framework (FastMCP)"),
     ("llama_index.core", "LlamaIndex chunking"),
-    ("transformers", "local Qwen3 reranker"),
-    ("torch", "local Qwen3 reranker"),
+    ("transformers", "local cross-encoder reranker"),
+    ("torch", "local cross-encoder reranker"),
 ]
 
 # Provider-specific embedding deps. Only required for the active provider.

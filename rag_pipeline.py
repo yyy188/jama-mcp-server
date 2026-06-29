@@ -9,9 +9,10 @@ Retrieval chain (``search`` method):
                    recall (FTS5), each limited to ``candidate_k``.
 3. RRF fusion    - Reciprocal Rank Fusion merges all candidate lists into one
                    ranked list of <= ``candidate_k`` unique chunks.
-4. Rerank        - local Qwen3-Reranker-0.6B scores (query, chunk) pairs; the
-                   top ``top_k`` are returned. If the model is unavailable and
-                   ``allow_fallback`` is set, RRF scores are used directly.
+4. Rerank        - a local cross-encoder (default ms-marco-MiniLM-L-6-v2)
+                   scores (query, chunk) pairs; the top ``top_k`` are returned.
+                   If the model is unavailable and ``allow_fallback`` is set,
+                   RRF scores are used directly.
 """
 from __future__ import annotations
 
@@ -598,17 +599,18 @@ def rrf_fuse(ranked_lists: list[list[str]], k: int = 60) -> list[tuple[str, floa
 
 
 # --------------------------------------------------------------------------- #
-# Qwen3 Reranker (lazy-loaded singleton)
+# Reranker (lazy-loaded singleton)
 # --------------------------------------------------------------------------- #
-class QwenReranker:
-    """Local Qwen3-Reranker-0.6B scorer (CPU).
+class Reranker:
+    """Local cross-encoder reranker scorer (CPU).
 
-    Loads lazily on first use so the MCP server starts fast and so a missing
-    model never blocks startup. With ``allow_fallback`` the pipeline degrades
-    to RRF-only scoring if loading fails.
+    Default model: ``cross-encoder/ms-marco-MiniLM-L-6-v2`` (~80MB). Loads
+    lazily on first use so the MCP server starts fast and a missing model never
+    blocks startup. With ``allow_fallback`` the pipeline degrades to RRF-only
+    scoring if loading fails.
     """
 
-    _instance: "QwenReranker | None" = None
+    _instance: "Reranker | None" = None
     _lock = threading.Lock()
     # Serializes the manual weights download so a concurrent bootstrap + sync
     # can't both write the same dest file (cache corruption). Held only across
@@ -647,9 +649,9 @@ class QwenReranker:
             return
         try:
             self._ensure_weights_downloaded(progress_callback=progress_callback)
-            log.info("Qwen3-Reranker weights ready (pre-downloaded during sync).")
+            log.info("Reranker model ready (pre-downloaded during sync).")
         except Exception as exc:
-            log.warning("Qwen3-Reranker pre-download failed (%s); "
+            log.warning("Reranker pre-download failed (%s); "
                         "will retry on first search or fall back to RRF.", exc)
 
     def _load(self) -> bool:
@@ -659,147 +661,133 @@ class QwenReranker:
             return False
         try:
             import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            log.info("Loading Qwen3-Reranker %s on %s ...",
+            from transformers import (AutoModelForSequenceClassification,
+                                      AutoTokenizer)
+            log.info("Loading reranker %s on %s ...",
                      self._cfg.model_name, self._cfg.device)
             # Ensure model weights are present locally. On first use this runs
             # a pre-flight speed test against the HF mirror and downloads the
-            # safetensors with resume+stall retry; aborts with a clear network
+            # weights with resume+stall retry; aborts with a clear network
             # error if the mirror is too slow instead of hanging. Returns the
             # local path to load from (cached snapshot or the manual download
             # dir), or None to load by model name from the HF cache.
             load_from = self._ensure_weights_downloaded()
             src = load_from or self._cfg.model_name
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                src, trust_remote_code=True)
-            # Load in bf16 (half the memory of fp32; modern CPUs support it via
-            # AVX512_BF16/AMX) with low_cpu_mem_usage to avoid a transient 2x
-            # peak while the weights are materialized. fp32 was ~2.4 GB; bf16
-            # is ~1.2 GB, leaving headroom for the forward-pass activations.
-            self._model = AutoModelForCausalLM.from_pretrained(
-                src, trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                low_cpu_mem_usage=True).to(self._cfg.device).eval()
-            log.info("Qwen3-Reranker loaded.")
+            self._tokenizer = AutoTokenizer.from_pretrained(src)
+            # Load in fp32. The cross-encoder is tiny (~80MB MiniLM), so the
+            # 2x memory peak of fp32 vs bf16 is negligible (~160MB), and fp32
+            # runs on EVERY CPU (no AVX512_BF16/AMX requirement that bf16 has).
+            # This is a sequence-classification head (1 logit per pair), not a
+            # causal LM, so there's no large [N, seq, vocab] logits tensor.
+            self._model = AutoModelForSequenceClassification.from_pretrained(
+                src).to(self._cfg.device).eval()
+            log.info("Reranker loaded.")
             return True
         except Exception as exc:
             self._load_error = str(exc)
-            log.warning("Qwen3 reranker unavailable (%s); "
+            log.warning("Reranker unavailable (%s); "
                         "RRF fallback will be used.", exc)
             return False
 
-    def _manual_weights_path(self) -> tuple[str, str]:
-        """Local ``(dest_dir, model.safetensors path)`` for the manual download.
-
-        Used when the HF-cache fast path fails: weights are fetched into a
-        project-local snapshot dir so transformers can load fully offline.
-        Centralised so cache-detection (``weights_cached``) and the download
-        path can't drift apart.
-        """
-        import os
-        from config import USER_DIR
-        cache_dir = os.environ.get("HF_HOME", str(USER_DIR / "huggingface"))
-        dest_dir = os.path.join(cache_dir, "hub",
-                                "models--" + self._cfg.model_name.replace("/", "--"),
-                                "snapshots", "manual")
-        return dest_dir, os.path.join(dest_dir, "model.safetensors")
-
     def weights_cached(self) -> bool:
-        """True if the reranker weights are already on disk (lightweight, no network).
+        """True if the reranker model is already on disk (lightweight, no network).
 
-        Checks only the manual snapshot dir — the location ``_ensure_weights_downloaded``
-        writes to when the HF-cache fast path fails (common on this network).
-        A false negative is harmless: ``bootstrap_models`` would re-download and
-        then no-op. Used by the startup hint, not by the load path.
+        Checks for the HF-cache snapshot dir that ``snapshot_download`` populates
+        (``<cache>/hub/models--<org>--<name>/snapshots/<rev>/``). A false negative
+        is harmless: ``bootstrap_models`` would re-download and then no-op. Used
+        by the startup hint, not by the load path.
         """
         if self._model is not None:
             return True
         import os
-        _dest_dir, dest = self._manual_weights_path()
-        return os.path.exists(dest) and os.path.getsize(dest) > 0
+        from config import USER_DIR
+        cache_dir = os.environ.get("HF_HOME", str(USER_DIR / "huggingface"))
+        # snapshot_download lays files under hub/models--<org>--<name>/snapshots/<rev>/
+        repo_dir = os.path.join(
+            cache_dir, "hub",
+            "models--" + self._cfg.model_name.replace("/", "--"))
+        snapshots = os.path.join(repo_dir, "snapshots")
+        if not os.path.isdir(snapshots):
+            return False
+        # Any non-empty snapshot revision dir counts as "downloaded".
+        return any(os.path.exists(os.path.join(snapshots, rev, "config.json"))
+                   for rev in os.listdir(snapshots))
 
     def _ensure_weights_downloaded(self, progress_callback=None) -> str | None:
-        """Make sure Qwen3-Reranker weights are cached locally.
+        """Make sure the reranker model is cached locally.
 
-        Returns the local directory to load from, or None if the model is
-        already in the HF cache (load by model name). If the weights aren't
-        cached, run a pre-flight speed test against the HF mirror and download
-        the safetensors with resume + stall retry into a local dir (with the
-        tokenizer/config files copied alongside) so transformers can load
-        offline. Raises ``NetworkTooSlowError`` on a slow/failed mirror.
+        Returns the local directory to load from (the HF cache snapshot dir).
+        Uses ``snapshot_download`` with ``allow_patterns`` to fetch ONLY the
+        files transformers actually needs to load the model — config + weights +
+        tokenizer. A MiniLM cross-encoder repo ships ~22 files (multiple weight
+        formats, tokenizer variants, onnx subdirs); pulling all of them tripled
+        the download time for no benefit. allow_patterns keeps it to ~6 files.
 
-        The manual download is serialized by ``_weights_lock`` with a re-check
-        inside, so a concurrent bootstrap + sync can't both write the same dest.
+        Serialized by ``_weights_lock`` so a concurrent bootstrap + sync can't
+        both download. ``snapshot_download`` has its own retries/timeouts; a
+        real failure is wrapped as ``NetworkTooSlowError`` for the caller.
+        snapshot_download gives no byte-level callback, so ``progress_callback``
+        is only invoked once at completion (not per-chunk).
         """
         import os
-        from huggingface_hub import hf_hub_download
-        from net_guard import (NetworkTooSlowError, download_with_retry,
-                               speed_test)
+        from huggingface_hub import snapshot_download
+        from net_guard import NetworkTooSlowError
 
         cfg = self._cfg
-        # Fast path: weights already in the HF cache -> load by model name.
-        # (hf_hub_download is internally locked by huggingface_hub, so concurrent
-        # callers here are safe.)
-        try:
-            path = hf_hub_download(repo_id=cfg.model_name,
-                                   filename="model.safetensors")
-            if os.path.getsize(path) > 0:
-                return None  # use model_name; transformers resolves the cache
-        except Exception:
-            pass  # not cached yet — fall through to guarded manual download
-
         endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
-        url = (f"{endpoint.rstrip('/')}/{cfg.model_name}/resolve/main/"
-               f"model.safetensors")
-        small_files = ("config.json", "tokenizer.json",
-                       "tokenizer_config.json", "vocab.json", "merges.txt",
-                       "chat_template.jinja")
-        # Manual download path — serialized. Re-check the local cache AFTER
-        # acquiring the lock: another thread (e.g. bootstrap while a sync also
-        # calls ensure_downloaded) may have just finished writing the weights,
-        # in which case we skip the network entirely. We MUST check before the
-        # speed test so a transient network blip doesn't degrade to RRF when the
-        # model is fully present on disk.
+        # NOTE: no pre-flight speed_test here. The previous one probed config.json
+        # (794 bytes) — too small to measure throughput (handshake latency
+        # dominated, falsely reporting <1 KB/s and aborting on good networks).
+        # snapshot_download has its own retries/timeouts; a real failure surfaces
+        # as the NetworkTooSlowError wrap below.
+
         with self._weights_lock:
-            dest_dir, dest = self._manual_weights_path()
-            if (os.path.exists(dest) and os.path.getsize(dest) > 0
-                    and all(os.path.exists(os.path.join(dest_dir, f))
-                            and os.path.getsize(os.path.join(dest_dir, f)) > 0
-                            for f in small_files)):
-                log.info("Qwen3-Reranker weights cached locally at %s; "
-                         "skipping network check.", dest_dir)
-                return dest_dir
-            # Pre-flight speed test against the mirror (1 MB probe). Aborts with
-            # a clear network error if the mirror is too slow.
-            speed_test(url, min_bytes_per_sec=cfg.hf_min_bytes_per_sec,
-                       timeout=cfg.hf_speed_test_timeout, label="hf-mirror")
-            # Download weights (resumable, stall-retried) into a local snapshot
-            # dir under the project-local HF cache (user/huggingface/hub/...).
-            os.makedirs(dest_dir, exist_ok=True)
-            download_with_retry(url, dest,
-                                min_bytes_per_sec=cfg.hf_min_bytes_per_sec,
-                                max_retries=cfg.hf_download_retries,
-                                label="qwen3-reranker",
-                                progress_callback=progress_callback)
-            # Fetch the small tokenizer/config files into the same snapshot dir
-            # so AutoTokenizer/AutoModel can load fully offline. These are tiny
-            # (<15MB total), so download directly by URL with light retry rather
-            # than relying on hf_hub_download (which may HEAD-fail here).
-            for fname in small_files:
-                link = os.path.join(dest_dir, fname)
-                if os.path.exists(link) and os.path.getsize(link) > 0:
-                    continue
-                furl = (f"{endpoint.rstrip('/')}/{cfg.model_name}/resolve/main/"
-                        f"{fname}")
+            # snapshot_download is idempotent: if the snapshot is already
+            # complete it returns the cached dir without re-downloading. We
+            # still hold the lock so two threads don't race on the same fetch.
+            # allow_patterns: only the files AutoTokenizer/AutoModel load. We
+            # match ONE weight format (safetensors preferred — transformers
+            # loads it faster and it's mmap-friendly; pytorch_model.bin as the
+            # fallback for repos that only ship .bin). Matching both would
+            # download the weights twice (~86MB each, wasted). onnx/openvino/
+            # flax/tf subdirs are also excluded — they're alternate runtimes we
+            # don't use.
+            try:
+                local_dir = snapshot_download(
+                    repo_id=cfg.model_name,
+                    allow_patterns=[
+                        "config.json",
+                        "model.safetensors",           # preferred weight format
+                        "tokenizer.json", "tokenizer_config.json",
+                        "vocab.txt", "vocab.json", "merges.txt",
+                        "special_tokens_map.json", "tokenizer*",
+                    ],
+                )
+            except Exception:
+                # Repo may only ship pytorch_model.bin (no safetensors). Retry
+                # with the .bin pattern so we still get the weights.
                 try:
-                    download_with_retry(furl, link,
-                                        min_bytes_per_sec=1_000,  # tiny files
-                                        max_retries=cfg.hf_download_retries,
-                                        chunk_timeout=20,
-                                        label=f"qwen3-{fname}")
+                    local_dir = snapshot_download(
+                        repo_id=cfg.model_name,
+                        allow_patterns=[
+                            "config.json", "pytorch_model.bin",
+                            "tokenizer.json", "tokenizer_config.json",
+                            "vocab.txt", "vocab.json", "merges.txt",
+                            "special_tokens_map.json", "tokenizer*",
+                        ],
+                    )
                 except Exception as exc:
-                    log.warning("Could not fetch %s: %s", fname, exc)
-            return dest_dir
+                    raise NetworkTooSlowError(
+                        f"Could not download reranker model {cfg.model_name}: "
+                        f"{exc}. Check network connectivity to {endpoint}.") from exc
+            if progress_callback is not None:
+                # snapshot_download gives no byte callback; report completion.
+                try:
+                    progress_callback(1, 1)
+                except Exception:
+                    pass
+            log.info("Reranker model cached at %s.", local_dir)
+            return local_dir
 
     def rerank(self, query: str, texts: list[str],
                batch_size: int | None = None) -> list[float]:
@@ -816,36 +804,28 @@ class QwenReranker:
 
     def _score(self, query: str, texts: list[str], batch_size: int) -> list[float]:
         import torch
-        # Qwen3-Reranker prompt format (official): prefix tokens mark
-        # query/document boundaries, and relevance = P("yes") from the
-        # token-scored last position.
-        prefix = ("<|im_start|>system\nJudge whether the Document meets the "
-                  "requirements based on the Query and only answer with yes "
-                  "or no.<|im_end|>\n<|im_start|>user\n")
-        suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        yes_id = self._tokenizer.convert_tokens_to_ids("yes")
-        no_id = self._tokenizer.convert_tokens_to_ids("no")
+        # Cross-encoder reranking: the model takes (query, document) pairs and
+        # outputs a single relevance logit per pair via a sequence-classification
+        # head. This is far cheaper than the old Qwen3 causal-LM approach (which
+        # built a [N, seq, 152k-vocab] logits tensor and read P("yes") at the
+        # last position). sigmoid(logit) maps to a 0..1 relevance score; since
+        # we only need a RELATIVE ordering for re-ranking, the raw logit would
+        # also work, but sigmoid keeps scores interpretable in tool output.
         scores: list[float] = []
         with torch.no_grad():
             for i in range(0, len(texts), batch_size):
                 batch = texts[i:i + batch_size]
-                prompts = [
-                    f"{prefix}\nQuery: {query}\nDocument: {t}\n{suffix}"
-                    for t in batch
-                ]
-                tok = self._tokenizer(prompts, padding=True, truncation=True,
+                # pairs = [(query, t) for t in batch]; the tokenizer accepts a
+                # (text, text) pair list and concatenates with [SEP] internally.
+                pairs = [(query, t) for t in batch]
+                tok = self._tokenizer(pairs, padding=True, truncation=True,
                                       max_length=self._cfg.max_length,
                                       return_tensors="pt").to(self._cfg.device)
-                # logits_to_keep=1: only compute logits for the LAST token
-                # position. Without this, the model materializes a full
-                # [batch, seq_len, vocab(~152k)] tensor (~5 GB at batch=16,
-                # seq=512, fp32) — the root cause of the prior OOM. We only
-                # need P("yes") at the final position, so 1 is sufficient and
-                # cuts that tensor by ~seq_len× (hundreds-fold).
-                out = self._model(**tok, logits_to_keep=1)
-                logits = out.logits[:, -1, :]
-                yes = torch.softmax(logits, dim=-1)[:, yes_id]
-                scores.extend(yes.tolist())
+                out = self._model(**tok)
+                # logits shape: [N, 1] (single relevance class). Squeeze to [N]
+                # and sigmoid -> 0..1 relevance. tolist() detaches to floats.
+                rel = torch.sigmoid(out.logits.squeeze(-1))
+                scores.extend(rel.tolist())
         return scores
 
 
@@ -862,7 +842,7 @@ class RAGPipeline:
         else:
             self.embedder = EmbeddingClient()
         self.expander = MultiQueryExpander(n=3)
-        self.reranker = QwenReranker()
+        self.reranker = Reranker()
 
     # ----- indexing ------------------------------------------------------ #
     def embed_chunks(self, chunks: list[dict]) -> list[list[float]]:

@@ -152,6 +152,8 @@ def main() -> int:
                     help="Skip prompts; just write .env from current env and validate.")
     ap.add_argument("--self-test", action="store_true",
                     help="After writing .env, run a live connectivity probe.")
+    ap.add_argument("--skip-models", action="store_true",
+                    help="Skip pre-downloading the embedding + reranker models.")
     args = ap.parse_args()
 
     if args.non_interactive:
@@ -189,6 +191,23 @@ def main() -> int:
     if report["blocking"]:
         print("\n✗ Setup incomplete — see issues above.")
         return 1
+
+    # Pre-download the embedding + reranker models so the first sync isn't
+    # slowed by a (possibly flaky) download. Skippable for offline/CI setups.
+    # Done AFTER the blocking check so we don't attempt a download against a
+    # broken config.
+    if not args.skip_models:
+        print("\n--- Model pre-download ---")
+        import bootstrap
+        try:
+            bootstrap.main()
+        except SystemExit as e:
+            # bootstrap.main() raises SystemExit; a non-zero code means a
+            # download failed, but config is still valid — warn, don't abort.
+            if e.code:
+                print("  (model pre-download incomplete; the server will retry "
+                      "on first sync.)")
+
     print("\n✓ Setup complete. Start the server with: python server.py")
     return 0
 
