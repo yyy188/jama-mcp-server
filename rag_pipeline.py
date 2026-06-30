@@ -459,7 +459,7 @@ class LocalEmbeddingClient:
     def ensure_downloaded(self) -> None:
         """Pre-download the embedding model without loading it.
 
-        Called at the very start of project sync so the (64 MB) download
+        Called at the very start of project sync so the (~130MB ONNX) download
         happens before any indexing work, alongside the reranker weights. If
         the model is already cached this is a fast no-op. A failure here is
         non-fatal: the actual load (and error) is deferred to first embed.
@@ -636,7 +636,7 @@ class Reranker:
     def ensure_downloaded(self, progress_callback=None) -> None:
         """Pre-download reranker weights without loading the model.
 
-        Called during project sync so the (1.2 GB) download happens up front,
+        Called during project sync so the (~80MB) download happens up front,
         alongside the embedding model — not deferred to the first search
         (where a download failure would surprise the user mid-query). If the
         weights are already cached this is a no-op. A failure here is

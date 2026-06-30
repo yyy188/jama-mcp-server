@@ -125,18 +125,21 @@ the `sub_queries` parameter; keep the original query in `query` (it is
 the rerank reference). This maximizes recall for RRF fusion and is
 preferred over letting the server fall back to lexical variants.
 
-MODEL BOOTSTRAP (first-run, before any init). The embedding model (~67MB)
-and cross-encoder reranker (~80MB) are NOT bundled — they download on first
-use. Call `bootstrap_models()` right after the server is configured: it
+MODEL BOOTSTRAP (first-run, before any init). The embedding model (~130MB
+ONNX) and cross-encoder reranker (~80MB) are NOT bundled — they download on
+first use. Call `bootstrap_models()` right after the server is configured: it
 downloads BOTH models asynchronously and returns a job_id immediately, so the
 first sync isn't slowed by a download and a download failure surfaces here
 instead of mid-sync. Poll `get_bootstrap_progress(job_id)` roughly every 2
-minutes, reporting each sample (status, progress %, message with live download
-bytes for the reranker, e.g. "Downloading reranker weights: 680/1200 MB") to the
-user, until status is DONE or ERROR. Already-cached models are skipped, so
-re-running bootstrap after success is a fast no-op. OPTIONAL: if skipped,
-init/sync still works (downloads on demand) but the first sync is slower and a
-download failure surfaces mid-sync — prefer running bootstrap first.
+minutes, reporting each sample (status, progress %, message) to the user,
+until status is DONE or ERROR. Progress is phase-based (not live bytes):
+snapshot_download (reranker) and fastembed (embedding) both lack per-chunk
+byte callbacks, so `message` reports phase transitions (e.g. "Downloading
+reranker model (...)" -> "Reranker model ready") rather than byte counts.
+Already-cached models are skipped, so re-running bootstrap after success is a
+fast no-op. OPTIONAL: if skipped, init/sync still works (downloads on demand)
+but the first sync is slower and a download failure surfaces mid-sync —
+prefer running bootstrap first.
 
 SYNC MONITORING. `init_jama_project` (first init) and `reinit_jama_project`
 (re-index an already-initialized project) run in the BACKGROUND and return a
@@ -249,11 +252,12 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
     upsert_project(conn, project_id, status="INITIALIZING")
 
     # ---- Step 1: pre-download ML models BEFORE any indexing work. ----
-    # Both the embedding model (64 MB) and the reranker (1.2 GB) are fetched
-    # first so that (a) a download failure surfaces immediately with a clear
-    # message instead of mid-sync, and (b) the first search after sync doesn't
-    # stall on a 1.2 GB download. Non-fatal: failures just defer to lazy load
-    # (embedding) or RRF fallback (reranker) — sync still proceeds.
+    # Both the embedding model (~130MB ONNX) and the reranker (~80MB MiniLM)
+    # are fetched first so that (a) a download failure surfaces immediately
+    # with a clear message instead of mid-sync, and (b) the first search
+    # after sync doesn't stall on a model download. Non-fatal: failures just
+    # defer to lazy load (embedding) or RRF fallback (reranker) — sync still
+    # proceeds.
     if job_id:
         update_job(conn, job_id, status="RUNNING", progress=0.0,
                    message="Downloading embedding + reranker models")
@@ -510,7 +514,7 @@ def _run_bootstrap_job(job_id: str) -> None:
     ``get_bootstrap_progress`` can be polled every ~2 min. The reranker
     (~80MB cross-encoder) downloads via ``snapshot_download``, which gives no
     per-chunk byte callback — so progress is reported as phase transitions
-    (downloading -> ready), not live bytes. The embedding model (~67MB) goes
+    (downloading -> ready), not live bytes. The embedding model (~130MB ONNX) goes
     through fastembed (also no byte callback), likewise phase-only. Either
     model already cached skips its download. Failures are non-fatal per-model
     (marked in the message) but the job still ends ERROR if any model is
@@ -531,7 +535,7 @@ def _run_bootstrap_job(job_id: str) -> None:
     # --- Phase 1: embedding model (local only; azure needs no download) ------
     if provider == "local":
         _set(0.1, f"Checking/downloading embedding model "
-                  f"({settings.embedding.local_model}, ~67MB)")
+                  f"({settings.embedding.local_model}, ~130MB)")
         emb = pipeline.embedder
         try:
             if emb._model_present():  # type: ignore[attr-defined]
@@ -696,7 +700,7 @@ _bootstrap_job_id: str | None = None
 def bootstrap_models() -> dict:
     """Pre-download the embedding + reranker models so syncs never wait on them.
 
-    Downloads the local embedding model (bge-small-en-v1.5, ~67MB) and the
+    Downloads the local embedding model (bge-small-en-v1.5, ~130MB ONNX) and the
     cross-encoder reranker (cross-encoder/ms-marco-MiniLM-L-6-v2, ~80MB) into the
     project-local cache, ASYNCHRONOUSLY.
     Returns a job_id immediately. This is the recommended first step after
@@ -748,10 +752,12 @@ def get_bootstrap_progress(job_id: str) -> dict:
     """Poll the progress of a bootstrap_models job.
 
     After calling bootstrap_models, poll this roughly every 2 minutes, reporting
-    each sample (status, progress %, message with live download bytes) to the
-    user, until status is DONE or ERROR. The message field carries concrete
-    download progress (e.g. "Downloading reranker weights: 680/1200 MB") while
-    the job is running.
+    each sample (status, progress %, message) to the user, until status is DONE
+    or ERROR. Progress is phase-based, not live bytes: both the embedding
+    (~130MB ONNX, via fastembed) and the reranker (~80MB, via snapshot_download)
+    lack per-chunk byte callbacks, so `message` reports phase transitions (e.g.
+    "Downloading reranker model (...)" -> "Reranker model ready") rather than
+    byte counts.
 
     Returns:
         {"job_id","project_id","kind","status","progress","total","done",

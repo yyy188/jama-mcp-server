@@ -115,10 +115,10 @@ To (re)download just the models later without re-running the wizard:
 python bootstrap.py
 ```
 
-The models live in `user/huggingface/` (project-local, ~150MB total: a 67MB
-embedding + 80MB cross-encoder reranker). They're plain data files — portable
-across machines, so you can also copy that folder from another machine to skip
-the download entirely.
+The models live in `user/huggingface/` (project-local, ~210MB total: a ~130MB
+ONNX embedding + ~80MB cross-encoder reranker). They're plain data files —
+portable across machines, so you can also copy that folder from another machine
+to skip the download entirely.
 
 ### Why pinned torch / onnxruntime versions
 
@@ -185,21 +185,22 @@ job plus its last init/reinit/sync run at any time with
 
 ## Model bootstrap
 
-The embedding model (~67MB, bge-small-en-v1.5) and the cross-encoder reranker
-(~1.2GB) are **not bundled** — they download on first use. To keep the first
-sync from stalling on a model download, call `bootstrap_models` right after the
-server is configured. It downloads BOTH models **asynchronously** (a
+The embedding model (~130MB ONNX, bge-small-en-v1.5) and the cross-encoder
+reranker (~80MB) are **not bundled** — they download on first use. To keep the
+first sync from stalling on a model download, call `bootstrap_models` right
+after the server is configured. It downloads BOTH models **asynchronously** (a
 `kind="bootstrap"` job in `sync_jobs`, run on the same thread pool as syncs) and
 returns a `job_id` immediately.
 
 - `bootstrap_models()` — start the async pre-download (no-op per model if
   already cached). Reentrancy-guarded: a second call while one is RUNNING
   returns the existing `job_id`.
-- `get_bootstrap_progress(job_id)` — poll every ~2 min. While the 1.2GB reranker
-  downloads, `message` carries live byte progress
-  (e.g. `"Downloading reranker weights: 680/1200 MB"`); the ~67MB embedding
-  model downloads via fastembed (no byte callback) so it reports phase
-  transitions only. `status` → `DONE` (both cached) or `ERROR`.
+- `get_bootstrap_progress(job_id)` — poll every ~2 min. Progress is
+  **phase-based, not live bytes**: the reranker downloads via
+  `snapshot_download` and the embedding via fastembed, neither of which gives a
+  per-chunk byte callback, so `message` reports phase transitions (e.g.
+  "Downloading reranker model (...)" → "Reranker model ready") rather than byte
+  counts. `status` → `DONE` (both cached) or `ERROR`.
 
 On startup, if either model isn't cached, the server logs a hint to call
 `bootstrap_models`. The sync-time `ensure_downloaded` calls remain as a fallback

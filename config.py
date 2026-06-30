@@ -23,10 +23,10 @@ USER_DIR = PROJECT_ROOT / "user"
 USER_DIR.mkdir(parents=True, exist_ok=True)
 
 # Use the HuggingFace China mirror by default so model weights (the ~80MB
-# cross-encoder reranker + ~67MB embedding model) can be downloaded from inside
-# mainland China. This is read by huggingface_hub / transformers when fetching
-# models. Override with HF_ENDPOINT in the environment if a different mirror is
-# preferred.
+# cross-encoder reranker + ~130MB ONNX embedding model) can be downloaded from
+# inside mainland China. This is read by huggingface_hub / transformers when
+# fetching models. Override with HF_ENDPOINT in the environment if a different
+# mirror is preferred.
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 # Default the HF cache to a project-local folder (user/huggingface) so the
 # reranker weights live inside the project, not in the user home dir.
@@ -110,7 +110,7 @@ class EmbeddingSettings:
     # 60% leaves headroom for the MCP server + scheduler on a shared host.
     cpu_percent: int = _get_int("EMBEDDING_CPU_PERCENT", 60)
     # Minimum download throughput (bytes/s) for the model mirror speed test.
-    # bge-small-en-v1.5 is ~67MB; at 200KB/s that's ~5min — acceptable.
+    # The bge-small-en-v1.5 ONNX model is ~130MB; at 200KB/s that's ~11min — acceptable.
     download_min_bps: int = _get_int("EMBEDDING_DOWNLOAD_MIN_BPS", 200_000)
     # --- azure provider settings ---
     base_url: str = _get("EMBEDDING_BASE_URL", "https://your-embedding-endpoint.example.com")

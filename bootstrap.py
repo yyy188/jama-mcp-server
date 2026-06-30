@@ -59,7 +59,7 @@ def _download_embedding() -> bool:
         print(f"  embedding model already cached ({settings.embedding.local_model}).")
         return True
     print(f"  downloading embedding model {settings.embedding.local_model} "
-          f"(~67MB) ...")
+          f"(~130MB ONNX) ...")
     before = _cache_size()
     t0 = time.monotonic()
     emb._download_model()
