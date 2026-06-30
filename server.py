@@ -1016,29 +1016,36 @@ def search_jama_semantics(project_id: str, query: str,
         return {"error": f"Invalid timestamp: {exc}"}
 
     try:
-        results = rag().search(pid, query.strip(),
-                               sub_queries=sub_queries,
-                               item_type=it,
-                               top_k=top_k, candidate_k=candidate_k,
-                               modified_after=modified_after,
-                               modified_before=modified_before)
+        pipeline = rag()
+        results = pipeline.search(pid, query.strip(),
+                                  sub_queries=sub_queries,
+                                  item_type=it,
+                                  top_k=top_k, candidate_k=candidate_k,
+                                  modified_after=modified_after,
+                                  modified_before=modified_before)
+        warnings = list(pipeline.last_warnings)
     except Exception as exc:
         log.error("search failed: %s\n%s", exc, traceback.format_exc())
         return {"error": f"Search failed: {exc}"}
     # Echo the query variants actually used by the pipeline so the caller can
-    # verify expansion happened. Computed defensively so a reflection failure
-    # never discards already-computed search results.
-    try:
-        from rag_pipeline import _normalize_sub_queries
-        used = _normalize_sub_queries(sub_queries or [], query.strip())
-    except Exception:
+    # verify expansion happened. Read from the pipeline (which records both
+    # caller-supplied and lexical-fallback variants) so the lexical-fallback
+    # path reports the real variants used, not just [query]. Computed
+    # defensively so a reflection failure never discards search results.
+    used = list(getattr(pipeline, "last_sub_queries", []) or [])
+    if not used:
         used = [query.strip()] if query.strip() else []
-    return {"project_id": pid, "query": query,
+    resp = {"project_id": pid, "query": query,
             "sub_queries_used": used,
             "count": len(results),
             "modified_after": modified_after,
             "modified_before": modified_before,
             "results": results}
+    if warnings:
+        # Surface silent degradations (e.g. reranker load failure -> RRF
+        # fallback) so the LLM can tell the user precision may be lower.
+        resp["warnings"] = warnings
+    return resp
 
 
 @mcp.tool()
@@ -1519,18 +1526,41 @@ def validate_setup(live: bool = False) -> dict:
 
 
 def _live_probe() -> dict:
-    """Live (network) checks for Jama auth + embedding endpoint."""
+    """Live (network) checks for Jama auth + the active embedding backend."""
     result: dict = {"jama": None, "embedding": None}
+    # Jama: OAuth + connectivity. The pre-flight speed test probes a single
+    # /projects page (~20KB) — too small for a stable bandwidth measurement
+    # (server-side processing latency dominates the body-transfer clock), so on
+    # a healthy link it routinely dips below the 20KB/s floor that's meant for
+    # the multi-MB model download. Treat a "too slow" verdict here as a
+    # non-fatal warning instead of a failure: ``list_projects()`` is the real
+    # proof that OAuth + connectivity work. The bandwidth gate still applies in
+    # the sync path, where a real download is about to start.
+    from net_guard import NetworkTooSlowError
+    client = jama()
+    speed_warning: str | None = None
     try:
-        client = jama()
         client.preflight_speed_check()
-        projects = list(client.list_projects())
-        result["jama"] = {"ok": True, "project_count": len(projects)}
+    except NetworkTooSlowError as exc:
+        speed_warning = str(exc)[:200]
     except Exception as exc:
         result["jama"] = {"ok": False, "error": str(exc)[:300]}
+    if result["jama"] is None:
+        try:
+            projects = list(client.list_projects())
+            info: dict = {"ok": True, "project_count": len(projects)}
+            if speed_warning:
+                info["speed_warning"] = speed_warning
+            result["jama"] = info
+        except Exception as exc:
+            result["jama"] = {"ok": False, "error": str(exc)[:300]}
+    # Embedding: probe the ACTIVE provider's embedder (local CPU bge or azure),
+    # not a hard-coded Azure client. The old code always instantiated
+    # ``EmbeddingClient()`` against the placeholder Azure URL, so under the
+    # default ``local`` provider ``validate_setup(live=True)`` always reported
+    # embedding failure even though local embedding worked fine.
     try:
-        from rag_pipeline import EmbeddingClient
-        vec = EmbeddingClient().embed_one("jama mcp validate")
+        vec = rag().embedder.embed_one("jama mcp validate")
         result["embedding"] = {"ok": True, "dimensions": len(vec)}
     except Exception as exc:
         result["embedding"] = {"ok": False, "error": str(exc)[:300]}

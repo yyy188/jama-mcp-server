@@ -37,6 +37,14 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(USER_DIR / "huggingface" / "h
 # huggingface_hub, which defaults to the Xet protocol; on some networks it
 # fails mid-transfer. Forcing the plain HTTPS path avoids the failure.
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+# Silence the tqdm "Fetching N files" / per-file progress bars that
+# huggingface_hub (snapshot_download, for the reranker weights) and fastembed
+# (ONNX download) emit. In a non-interactive shell — especially the MCP stdio
+# server, which runs headless — those bars spam thousands of carriage-return
+# lines on stderr and look like a hang. Set here (not just in bootstrap.py) so
+# server-driven syncs and selftest are silenced too; huggingface_hub reads
+# HF_HUB_DISABLE_PROGRESS_BARS lazily on each download.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 # Once weights are cached we prefer offline mode so transient network errors
 # never block reranker loading in production.
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "0")
@@ -287,6 +295,27 @@ def validate_config() -> list[dict]:
                 "feature": feature,
                 "message": f"{name} is still a placeholder ({val}). Set the "
                            f"real value via the setup wizard or configure_jama.",
+            })
+    # Orphan Azure config: EMBEDDING_BASE_URL / EMBEDDING_API_KEY are only
+    # used when EMBEDDING_PROVIDER=azure. If they're set under the default
+    # "local" provider they're silently ignored — a common misconfiguration
+    # that wastes a configured endpoint. Warn (not error) so the rest of the
+    # server still works; the user just needs to either set
+    # EMBEDDING_PROVIDER=azure or drop the unused vars.
+    if os.environ.get("EMBEDDING_PROVIDER", "local") != "azure":
+        orphans = [v for v in ("EMBEDDING_BASE_URL", "EMBEDDING_API_KEY",
+                               "EMBEDDING_MODEL", "EMBEDDING_DIMENSIONS")
+                   if os.environ.get(v, "").strip()
+                   and not os.environ.get(v, "").strip().startswith("your-")]
+        if orphans:
+            issues.append({
+                "field": "EMBEDDING_PROVIDER", "severity": "warn",
+                "feature": "embedding",
+                "message": f"Azure embedding vars ({', '.join(orphans)}) are "
+                           f"set but EMBEDDING_PROVIDER=local — they are "
+                           f"ignored. To use Azure, set EMBEDDING_PROVIDER="
+                           f"azure (this rebuilds the vector index); otherwise "
+                           f"remove the unused vars to avoid confusion.",
             })
     return issues
 

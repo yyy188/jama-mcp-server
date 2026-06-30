@@ -97,7 +97,14 @@ their old chunks replaced atomically.
 ## Setup
 
 ```bash
-# 1. Install (uses Aliyun mirror; torch CPU build from the PyTorch CPU index)
+# 1a. Install CPU torch FIRST, on its own, forcing the PyTorch CPU index.
+#     This is the reliable way to get the ~200MB CPU build — installing torch
+#     alongside the rest of the deps can let a mirror hand back the 6GB CUDA
+#     wheel instead (it loads fine but breaks the reranker on Windows via
+#     WinError 1114 and wastes ~6GB of disk).
+pip install torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
+
+# 1b. Then install the rest of the dependencies (Aliyun mirror for speed).
 pip install -r requirements.txt
 
 # 2. Configure + pre-download models (the wizard writes .env, validates deps +
@@ -108,6 +115,15 @@ python setup_wizard.py --self-test
 # 3. Run (stdio transport for an MCP client)
 python server.py
 ```
+
+> **Upgrading from a prior CUDA torch install?** Uninstall the CUDA packages
+> together, or a leftover `torchaudio`/`torchvision` will keep its CUDA `.pyd`
+> and silently break reranker loading:
+> ```bash
+> pip uninstall torch torchaudio torchvision -y
+> ```
+> Then run step 1a above. The setup wizard's pre-flight (`validate_setup`)
+> now warns about a CUDA torch build or a version-mismatched companion package.
 
 To (re)download just the models later without re-running the wizard:
 
@@ -128,7 +144,7 @@ to skip the download entirely.
 - The default CUDA `torch` from the Aliyun mirror is ~6 GB and depends on a new
   VC++ Runtime (`vcruntime140_1.dll`) absent on many Windows machines, causing
   `WinError 1114` DLL load failures. The CPU build (~200 MB) has no such
-  dependency and is all a 0.6B CPU reranker needs.
+  dependency and is all an ~80MB MiniLM CPU reranker needs.
 - `onnxruntime` 1.27.0 (what `fastembed` pulls on Python 3.13+) triggers the
   same VC++ DLL issue on Windows. 1.20.1 satisfies `fastembed`'s constraint on
   Python 3.10–3.12 (`>=1.17.0, !=1.20.0`) and loads cleanly; Python 3.13+ needs

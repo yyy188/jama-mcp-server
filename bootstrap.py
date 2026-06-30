@@ -18,12 +18,26 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config  # noqa: F401  (loads .env + sets HF env vars)
 from config import settings
+
+# Silence the tqdm progress bars that fastembed / huggingface_hub emit during
+# downloads. In a non-interactive shell (piped output, MCP-driven runs) those
+# bars spam thousands of carriage-return lines that are unreadable and make it
+# look like the process is stuck. We replace them with periodic one-line prints
+# driven by the progress thread below.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+try:
+    import tqdm  # type: ignore
+    tqdm.tqdm.monitor_interval = 0  # disable the tqdm monitor thread
+except Exception:
+    pass
 
 
 def _human_bytes(n: int) -> str:
@@ -47,6 +61,42 @@ def _cache_size() -> int:
     return total
 
 
+class _ProgressReporter:
+    """Print periodic cache-size growth while a download runs.
+
+    fastembed / snapshot_download give no usable byte callback, so we poll the
+    cache directory size from a daemon thread and emit one line every ~10s.
+    This gives the user visible movement ("cache grew to 48 MB") instead of a
+    silent multi-minute hang. Stopped via the ``stop()`` event.
+    """
+
+    def __init__(self, label: str):
+        self._label = label
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self):
+        self._start = _cache_size()
+        self._t0 = time.monotonic()
+
+        def _loop():
+            while not self._stop.wait(10.0):
+                grew = _cache_size() - self._start
+                dt = time.monotonic() - self._t0
+                print(f"    ... {self._label}: {_human_bytes(grew)} so far "
+                      f"({dt:.0f}s)", flush=True)
+
+        self._thread = threading.Thread(target=_loop, daemon=True,
+                                        name="bootstrap-progress")
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+
 def _download_embedding() -> bool:
     """Download the embedding model (local provider only). Returns True on OK."""
     if settings.embedding.provider != "local":
@@ -62,7 +112,8 @@ def _download_embedding() -> bool:
           f"(~130MB ONNX) ...")
     before = _cache_size()
     t0 = time.monotonic()
-    emb._download_model()
+    with _ProgressReporter("embedding download"):
+        emb._download_model()
     dt = time.monotonic() - t0
     grew = _cache_size() - before
     print(f"  embedding model downloaded ({_human_bytes(grew)} in {dt:.0f}s).")
@@ -80,7 +131,8 @@ def _download_reranker() -> bool:
           f"(~80MB) ...")
     before = _cache_size()
     t0 = time.monotonic()
-    rr.ensure_downloaded()
+    with _ProgressReporter("reranker download"):
+        rr.ensure_downloaded()
     dt = time.monotonic() - t0
     grew = _cache_size() - before
     print(f"  reranker model downloaded ({_human_bytes(grew)} in {dt:.0f}s).")

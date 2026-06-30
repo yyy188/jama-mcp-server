@@ -191,7 +191,7 @@ class EmbeddingClient:
             return []
         if concurrency <= 1 or len(texts) <= self._batch:
             return self.embed_texts(texts)
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         # Slice into batches; record (start_index, batch) so we can place
         # each result back at the right position.
@@ -200,9 +200,6 @@ class EmbeddingClient:
             slices.append((i, texts[i:i + self._batch]))
 
         out: list[list[float] | None] = [None] * len(texts)
-
-        def _embed_slice(start_batch: list[str], batch_texts: list[str]) -> None:
-            return start_batch, batch_texts
 
         def _do(batch_texts: list[str]) -> list[list[float]]:
             r = self._sess.post(self._url, headers=self._headers,
@@ -217,14 +214,32 @@ class EmbeddingClient:
 
         with ThreadPoolExecutor(max_workers=concurrency,
                                 thread_name_prefix="embed") as ex:
-            futures = {ex.submit(_do, bt): (start, bt) for start, bt in slices}
-            for fut in futures:
-                start, bt = futures[fut]
+            future_to_meta = {ex.submit(_do, bt): (start, len(bt))
+                              for start, bt in slices}
+            # Collect as_completed so one slow batch can't block collection of
+            # already-finished ones (iterating futures in submission order would
+            # serialize the wait on the first slow batch).
+            for fut in as_completed(future_to_meta):
+                start, n = future_to_meta[fut]
                 embs = fut.result()
+                # A short response would silently leave gaps; the old code
+                # filtered them out with `if v is not None`, dropping the
+                # missing slots and misaligning chunks<->embeddings (writing
+                # half-indexed vectors into the vec table). Raise loudly so the
+                # batch fails instead of corrupting the index.
+                if len(embs) != n:
+                    raise RuntimeError(
+                        f"Embedding API returned {len(embs)} vectors for {n} "
+                        f"inputs (batch at offset {start}); aborting to avoid "
+                        f"chunk/embedding misalignment.")
                 for j, e in enumerate(embs):
                     out[start + j] = e
-        # All positions filled (batches are contiguous); cast away None.
-        return [v for v in out if v is not None]
+        # Every slot is filled (batches are contiguous and count-checked above);
+        # guard against a logic error rather than silently filtering Nones.
+        if any(v is None for v in out):
+            raise RuntimeError(
+                "Internal error: embedding result has unfilled slots.")
+        return out  # type: ignore[return-value]
 
 
 # --------------------------------------------------------------------------- #
@@ -843,6 +858,16 @@ class RAGPipeline:
             self.embedder = EmbeddingClient()
         self.expander = MultiQueryExpander(n=3)
         self.reranker = Reranker()
+        # Per-search warnings surfaced to the caller (e.g. reranker load
+        # failed -> RRF fallback). Reset at the start of each `search`;
+        # read by `search_jama_semantics` so the LLM/user can see silent
+        # degradations instead of just a changed `strategy` field.
+        self.last_warnings: list[str] = []
+        # The sub-queries actually used for the most recent `search` (caller-
+        # supplied after normalization, or the lexical-fallback variants).
+        # Read by `search_jama_semantics` to echo the real variants used, so
+        # the lexical-fallback path reports them instead of just [query].
+        self.last_sub_queries: list[str] = []
 
     # ----- indexing ------------------------------------------------------ #
     def embed_chunks(self, chunks: list[dict]) -> list[list[float]]:
@@ -890,6 +915,9 @@ class RAGPipeline:
         at the recall layer so RRF fusion and reranking only see in-range
         candidates.
         """
+        # Reset per-search warnings so each call reports only its own.
+        self.last_warnings = []
+        self.last_sub_queries = []
         # Caller-supplied sub-queries win; otherwise fall back to the
         # deterministic lexical expander. Either way ``query`` itself is
         # guaranteed present (it's the rerank reference) and the list is
@@ -898,6 +926,8 @@ class RAGPipeline:
             sub_queries = _normalize_sub_queries(sub_queries, query)
         else:
             sub_queries = self.expander.expand(query) or [query]
+        # Record the variants actually used so the caller can echo them.
+        self.last_sub_queries = list(sub_queries)
 
         conn = get_connection()
         try:
@@ -932,7 +962,15 @@ class RAGPipeline:
             rr_scores = self.reranker.rerank(query, texts)
             used_rerank = any(s != 0.0 for s in rr_scores)
             if not used_rerank:
-                # Fallback to RRF ordering/scores.
+                # Fallback to RRF ordering/scores. Surface WHY the reranker
+                # was unavailable so the caller (LLM/user) doesn't silently
+                # get lower-precision results — a changed `strategy` field
+                # alone is easy to miss.
+                err = getattr(self.reranker, "_load_error", None) or \
+                    "reranker returned all-zero scores"
+                self.last_warnings.append(
+                    f"Reranker unavailable ({err}); results ranked by RRF "
+                    f"only — precision may be lower than usual.")
                 rr_scores = [rrf_scores[cid] for cid in ordered]
 
             scored = sorted(zip(ordered, rr_scores),

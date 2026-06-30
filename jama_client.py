@@ -251,8 +251,11 @@ class JamaClient:
                 r = self._s.get(url, headers=self._headers(), params=params,
                                 timeout=cfg.request_timeout)
                 if r.status_code == 401 and not refreshed:
-                    # Token expired/revoked mid-pagination: refresh once and
-                    # retry this page immediately (don't burn a retry slot).
+                    # Token expired/revoked mid-pagination: clear it so the next
+                    # _headers() call refreshes, then retry this page on the
+                    # next loop iteration. This consumes one of the
+                    # page_max_retries slots, but 401 mid-pagination is rare and
+                    # the budget (5) absorbs it.
                     with self._lock:
                         self._token = None
                     refreshed = True
