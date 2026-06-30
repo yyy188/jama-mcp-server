@@ -11,14 +11,20 @@ from pathlib import Path
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
 except Exception:  # pragma: no cover - dotenv is optional at runtime
-    pass
+    load_dotenv = None
 
 # Project root = directory containing this config.py. All runtime artifacts
 # (SQLite DB, HF model cache) default to a project-local ``user/`` folder so
 # the server is self-contained and portable.
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Load .env from the project root (not the caller's cwd) so the server picks
+# up its configuration no matter what directory an MCP client launches it
+# from. ``load_dotenv()`` with no path searches the cwd, which is unreliable
+# for a stdio server spawned by Claude Desktop / Copilot CLI / etc.
+if load_dotenv is not None:
+    load_dotenv(PROJECT_ROOT / ".env")
 USER_DIR = PROJECT_ROOT / "user"
 USER_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -66,6 +72,16 @@ def _get_float(name: str, default: float) -> float:
         return float(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _project_path(path: str) -> str:
+    """Resolve a path against PROJECT_ROOT when it is relative.
+
+    Keeps path-like settings (e.g. the SQLite DB) inside the project
+    regardless of the caller's cwd, so a stdio MCP server launched from an
+    arbitrary directory still finds its files. Absolute paths pass through.
+    """
+    return path if Path(path).is_absolute() else str(PROJECT_ROOT / path)
 
 
 @dataclass(frozen=True)
@@ -180,7 +196,7 @@ class RerankerSettings:
 class StorageSettings:
     # SQLite DB lives in the project-local user/ folder by default so all
     # runtime data is self-contained. Override with JAMA_MCP_DB_PATH.
-    db_path: str = _get("JAMA_MCP_DB_PATH", str(USER_DIR / "jama_mcp.db"))
+    db_path: str = _project_path(_get("JAMA_MCP_DB_PATH", str(USER_DIR / "jama_mcp.db")))
     # Busy timeout (ms) for SQLite write concurrency (init sync vs. reads).
     busy_timeout_ms: int = _get_int("SQLITE_BUSY_TIMEOUT_MS", 5000)
 
@@ -366,7 +382,7 @@ def reload_settings() -> None:
     call time, not import time).
     """
     try:
-        load_dotenv(override=True)
+        load_dotenv(PROJECT_ROOT / ".env", override=True)
     except Exception:  # pragma: no cover
         pass
     settings.jama = JamaSettings()
