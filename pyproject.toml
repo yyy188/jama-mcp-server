@@ -1,7 +1,7 @@
 [project]
 name = "jama-mcp-server"
 version = "0.1.0"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10,<3.13"
 description = "Jama MCP Server — high-precision RAG + native REST query for Jama, CPU-only"
 
 # All dependencies are CPU-only. The cross-encoder reranker and the bge
@@ -28,15 +28,17 @@ dependencies = [
     # ms-marco-MiniLM-L-6-v2 cross-encoder reranker. TextCrossEncoder (the
     # reranker API) is stable from 0.7+.
     "fastembed>=0.7.0",
-    # onnxruntime: shared by the embedding and reranker models. Pin to a version
-    # whose Windows DLLs don't require the new VC++ Runtime. fastembed's constraint
-    # is Python-version-dependent:
-    #   py3.10-3.12 -> >=1.17.0, !=1.20.0   (1.20.1 is allowed and stable)
-    #   py3.13+     -> >1.21.0              (must use a newer build)
-    # 1.27.0 (what fastembed 0.8.0 pulls on py3.13) triggers a VC++ DLL failure
-    # on Windows, so for py3.13+ we pin 1.21.1 (the lowest satisfying >1.21).
-    'onnxruntime==1.20.1; python_version < "3.13"',
-    'onnxruntime==1.21.1; python_version >= "3.13"',
+    # onnxruntime: shared by the embedding and reranker models. Pinned to
+    # 1.20.1 — newer versions (1.27.0, what fastembed pulls on py3.13+)
+    # depend on the new VC++ Runtime (vcruntime140_1.dll) absent on many
+    # Windows machines, causing WinError 1114 DLL load failures. 1.20.1
+    # loads cleanly on Windows and satisfies fastembed's constraint
+    # (>=1.17.0, !=1.20.0) on py3.10-3.12.
+    #
+    # Python 3.13+ is intentionally NOT supported (requires-python <3.13):
+    # it forces onnxruntime >=1.21, whose Windows builds hit the same VC++
+    # DLL issue. Use Python 3.12 (the verified stable target).
+    "onnxruntime==1.20.1",
     # --- Background incremental sync scheduler ---
     "APScheduler>=3.10.0",
     # APScheduler 3.x imports pkg_resources, removed in setuptools>=81.

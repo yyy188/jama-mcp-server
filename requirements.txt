@@ -39,11 +39,12 @@ lxml>=5.0.0
 # --- Local embedding + cross-encoder reranker (both ONNX via fastembed) ---
 fastembed>=0.7.0
 
-# onnxruntime: shared by the embedding and reranker models. Pinned to a version
-# whose Windows DLLs don't require the new VC++ Runtime (1.27.0 triggers
-# WinError 1114 on Windows). py3.10-3.12 -> 1.20.1; py3.13+ -> 1.21.1.
-onnxruntime==1.20.1; python_version < "3.13"
-onnxruntime==1.21.1; python_version >= "3.13"
+# onnxruntime: shared by the embedding and reranker models. Pinned to 1.20.1 —
+# newer versions (1.27.0, what fastembed pulls on py3.13+) depend on the new
+# VC++ Runtime absent on many Windows machines (WinError 1114). Python 3.13+
+# is NOT supported (use 3.12); it forces onnxruntime >=1.21 which hits the
+# same VC++ DLL issue.
+onnxruntime==1.20.1
 
 # --- Background incremental sync scheduler ---
 APScheduler>=3.10.0

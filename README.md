@@ -198,14 +198,17 @@ via fastembed — CPU-only, no torch/transformers. The model files are plain
 data — portable across machines, so you can copy that folder from another
 machine to skip the download entirely.
 
-### Why pinned onnxruntime versions
+### Why pinned onnxruntime / Python 3.12
 
-`onnxruntime` is pinned to **`1.20.1`** (or `1.21.1` on Python 3.13+) on
-purpose: 1.27.0 (what `fastembed` pulls on Python 3.13+) depends on the new
-VC++ Runtime absent on many Windows machines, causing `WinError 1114` DLL load
-failures. The pin protects the whole ML stack (embedding + reranker share this
-single runtime). If you upgrade it, re-test on a clean Windows machine without
-the latest VC++ Redistributable.
+`onnxruntime` is pinned to **`1.20.1`** and **Python 3.13+ is not supported**
+(`requires-python = ">=3.10,<3.13"`). On Windows, onnxruntime ≥1.21 (which
+Python 3.13 forces, because fastembed requires `>1.21` there) depends on the
+new VC++ Runtime (`vcruntime140_1.dll`) absent on many machines, causing
+`WinError 1114` DLL load failures. 1.20.1 loads cleanly on Python 3.10–3.12
+and satisfies fastembed's constraint. `uv sync` automatically picks Python
+3.12 (the verified stable target) from the lockfile. If you upgrade
+onnxruntime, re-test on a clean Windows machine without the latest VC++
+Redistributable.
 
 After the server starts, the LLM client should call `bootstrap_models` (and poll
 `get_bootstrap_progress` every ~2 min) to pre-download the embedding + reranker
