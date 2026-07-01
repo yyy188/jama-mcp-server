@@ -102,6 +102,18 @@ user-initiated one.
 
 ## Setup
 
+### Get the code
+
+```bash
+# Direct (if GitHub is reachable)
+git clone https://github.com/yyy188/jama-mcp-server.git jama
+cd jama
+
+# China mirror (if github.com is slow/blocked)
+git clone https://gh-proxy.com/https://github.com/yyy188/jama-mcp-server.git jama
+cd jama
+```
+
 ### Recommended: `uv` (deterministic, reproducible)
 
 [`uv`](https://docs.astral.sh/uv/) is a single-binary Python package manager
