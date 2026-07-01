@@ -210,6 +210,32 @@ and satisfies fastembed's constraint. `uv sync` automatically picks Python
 onnxruntime, re-test on a clean Windows machine without the latest VC++
 Redistributable.
 
+### Windows: VC++ Runtime (vcruntime140.dll)
+
+onnxruntime is a C++ binary that needs `vcruntime140.dll` — part of the
+Microsoft VC++ Redistributable. Most Windows machines already have it
+(anything with Chrome / Java / VS Code installed does), but a clean Windows
+install may not.
+
+The server **auto-detects** this: `preflight` probes for the DLL and, if
+missing, reports a clear blocking error with the fix. `setup_wizard.py`
+offers to **auto-install** it (downloads the 24 MB installer from
+`https://aka.ms/vs/16/release/vc_redist.x64.exe` — reachable from mainland
+China at ~420 KB/s — and runs it silently). You can also install it manually:
+
+```bash
+# From the project directory (after uv sync):
+uv run python -c "from preflight import install_vcruntime; install_vcruntime()"
+# Or download + run the installer yourself:
+#   https://aka.ms/vs/16/release/vc_redist.x64.exe
+```
+
+This is a **system-level** install (writes `vcruntime140.dll` to
+`C:\Windows\System32`, requires admin/UAC) — it's the one thing this project
+installs outside its own folder, because the DLL must be in the system path
+for onnxruntime to find it. Linux/macOS don't need it (onnxruntime bundles
+the system libs in its wheels there).
+
 After the server starts, the LLM client should call `bootstrap_models` (and poll
 `get_bootstrap_progress` every ~2 min) to pre-download the embedding + reranker
 models BEFORE the first `init_jama_project` — see [Model bootstrap](#model-bootstrap).

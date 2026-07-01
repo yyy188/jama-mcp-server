@@ -179,6 +179,28 @@ def main() -> int:
         print(f"  • {line}")
     print(f"  blocking={report['blocking']}")
 
+    # If the Windows VC++ Runtime is missing (vcruntime140.dll), offer to
+    # auto-install it before reporting blocking — onnxruntime can't import
+    # without it, so this is the single most common install blocker on a
+    # clean Windows machine.
+    vc = report.get("dependencies", {}).get("vcruntime", {})
+    if vc and not vc.get("ok") and not args.non_interactive:
+        print(f"\n  ⚠ {vc['message']}")
+        ans = input("  Auto-install VC++ Redistributable now? [Y/n] ").strip().lower()
+        if ans in ("", "y", "yes"):
+            try:
+                from preflight import install_vcruntime
+                install_vcruntime()
+                print("  ✓ VC++ Redistributable installed. Re-checking...")
+                report = preflight(require={"jama", "embedding"})
+                for line in report["issues"]:
+                    print(f"  • {line}")
+                print(f"  blocking={report['blocking']}")
+            except Exception as exc:
+                print(f"  ✗ Auto-install failed: {exc}")
+                print(f"    Download manually from: "
+                      f"https://aka.ms/vs/16/release/vc_redist.x64.exe")
+
     if args.self_test:
         print("\n--- Live connectivity self-test ---")
         st = _live_selftest()

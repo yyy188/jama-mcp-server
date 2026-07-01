@@ -54,12 +54,94 @@ def _try_import(name: str) -> tuple[bool, str]:
         return False, str(exc)[:200]
 
 
+# Download URL for the Microsoft VC++ Redistributable (x64). aka.ms is a
+# Microsoft short-link that redirects to the current stable build on
+# download.visualstudio.microsoft.com — verified reachable from mainland China
+# (~420 KB/s, ~25MB). This is the ONLY system dependency onnxruntime 1.20.1
+# needs on Windows (vcruntime140.dll); it ships with most Windows machines
+# (any machine that has Chrome / Java / VS Code already has it), but a clean
+# Windows install may lack it.
+_VC_REDIST_URL = "https://aka.ms/vs/16/release/vc_redist.x64.exe"
+
+
+def _check_vcruntime() -> tuple[bool, str]:
+    """Check whether vcruntime140.dll is loadable on this Windows machine.
+
+    onnxruntime 1.20.1 (the pinned version) is a C++ binary that dynamically
+    links vcruntime140.dll. On a clean Windows install without the VC++
+    Redistributable, importing onnxruntime fails with ``OSError: [WinError
+    126]`` / ``WinError 1114``. This probe catches that BEFORE the user hits a
+    confusing onnxruntime import error, and points them at the fix.
+
+    Returns ``(ok, message)``. On non-Windows platforms always ``(True, "")``
+    (onnxruntime ships the system libs in its Linux/macOS wheels).
+    """
+    import sys
+    if sys.platform != "win32":
+        return True, ""
+    try:
+        import ctypes
+        ctypes.WinDLL("vcruntime140.dll")
+        return True, ""
+    except OSError:
+        return False, (
+            "vcruntime140.dll not found. onnxruntime (the ML runtime for the "
+            "embedding + reranker models) needs the Microsoft VC++ Redistributable. "
+            "Run `python -c \"from preflight import install_vcruntime; "
+            "install_vcruntime()\"` to auto-install it, or download manually from "
+            f"{_VC_REDIST_URL} (24MB, ~1min on a China connection).")
+
+
+def install_vcruntime() -> str:
+    """Download and silently install the VC++ Redistributable (Windows x64).
+
+    Called when ``_check_vcruntime`` reports the DLL is missing. Downloads
+    vc_redist.x64.exe from the Microsoft aka.ms short-link (verified reachable
+    from mainland China), then runs it with ``/install /quiet /norestart``.
+    Requires admin privileges (UAC prompt); on success vcruntime140.dll lands
+    in C:\\Windows\\System32. Returns the path to the downloaded installer.
+    """
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    import urllib.request
+
+    if sys.platform != "win32":
+        raise RuntimeError("VC++ Redistributable is Windows-only.")
+
+    dest = os.path.join(tempfile.gettempdir(), "vc_redist.x64.exe")
+    if not os.path.exists(dest):
+        log.info("Downloading VC++ Redistributable from %s ...", _VC_REDIST_URL)
+        urllib.request.urlretrieve(_VC_REDIST_URL, dest)
+        log.info("Downloaded VC++ Redistributable (%d bytes).",
+                 os.path.getsize(dest))
+    else:
+        log.info("VC++ Redistributable installer already cached at %s.", dest)
+
+    log.info("Installing VC++ Redistributable (silent, may show a UAC prompt)...")
+    # /install /quiet /norestart: install without UI, no reboot.
+    result = subprocess.run(
+        [dest, "/install", "/quiet", "/norestart"],
+        capture_output=True, text=True)
+    if result.returncode == 0:
+        log.info("VC++ Redistributable installed successfully.")
+    elif result.returncode == 1638:
+        # 1638 = a newer version is already installed (treat as success).
+        log.info("VC++ Redistributable already installed (newer version).")
+    else:
+        raise RuntimeError(
+            f"VC++ Redistributable install failed (exit {result.returncode}): "
+            f"{result.stderr[:300]}. Try running {dest} manually.")
+    return dest
+
+
 def check_dependencies() -> dict[str, Any]:
     """Return a structured dependency report.
 
     Shape::
         {"ok": bool, "missing_core": [...], "missing_optional": [...],
-         "checked": int}
+         "vcruntime": {"ok": bool, "message": str}, "checked": int}
     """
     missing_core: list[dict] = []
     missing_optional: list[dict] = []
@@ -83,10 +165,15 @@ def check_dependencies() -> dict[str, Any]:
         checked += 1
         if not ok:
             missing_core.append({"package": name, "purpose": purpose, "error": err})
+    # Windows system DLL check: onnxruntime needs vcruntime140.dll. A clean
+    # Windows without the VC++ Redistributable will fail to import onnxruntime
+    # with a cryptic WinError — this surfaces the real cause + the fix.
+    vc_ok, vc_msg = _check_vcruntime()
     return {
-        "ok": not missing_core,
+        "ok": not missing_core and vc_ok,
         "missing_core": missing_core,
         "missing_optional": missing_optional,
+        "vcruntime": {"ok": vc_ok, "message": vc_msg},
         "checked": checked,
     }
 
@@ -131,6 +218,13 @@ def preflight(*, require: set[str] | None = None) -> dict[str, Any]:
         for m in deps["missing_core"]:
             issues.append(f"Missing core dependency '{m['package']}' ({m['purpose']}). "
                           f"Run: pip install -r requirements.txt")
+
+    # Windows VC++ Runtime: onnxruntime needs vcruntime140.dll. Missing it is
+    # blocking for the local embedding/reranker path (onnxruntime won't import).
+    vc = deps.get("vcruntime", {})
+    if not vc.get("ok", True):
+        blocking = True
+        issues.append(f"[system] {vc['message']}")
 
     if not storage["ok"]:
         blocking = True
