@@ -382,20 +382,37 @@ def vector_search(conn: sqlite3.Connection, query_vec: list[float],
                   modified_before: str | None = None) -> list[sqlite3.Row]:
     """Semantic recall via sqlite-vec, joined back to chunk metadata.
 
+    Uses vec0's native KNN: ``WHERE embedding MATCH ? AND k=?`` returns the
+    k nearest vectors with a ``distance`` column. We over-fetch (k = limit*4)
+    then filter by project_id / item_type / date range in the outer query, so
+    enough candidates survive the filter to fill ``limit``.
+
     Optional ``modified_after``/``modified_before`` (ISO-8601, normalized to
     UTC) restrict results to items modified within a [after, before] range
     (inclusive on both ends).
     """
+    # Build the query blob once.
+    qblob = _vec_blob(query_vec)
+    # Over-fetch: KNN returns the k nearest across ALL projects; we then
+    # filter to this project. A large project (5000+ items) needs a generous
+    # k so enough same-project candidates survive. k = limit * 8 handles
+    # projects up to ~40k items (8x over-fetch).
+    k = max(limit * 8, 200)
+
     q = """
         SELECT c.chunk_id, c.item_id, c.project_id, c.item_type,
                c.item_type_name, c.document_key, c.name, c.status,
                c.section, c.chunk_index, c.text, c.modified_date,
-               v.distance AS score
-        FROM chunks_vec v
-        JOIN chunks c ON c.chunk_id = v.chunk_id
+               knn.distance AS score
+        FROM (
+            SELECT chunk_id, distance
+            FROM chunks_vec
+            WHERE embedding MATCH ? AND k = ?
+        ) knn
+        JOIN chunks c ON c.chunk_id = knn.chunk_id
         WHERE c.project_id = ?
     """
-    params: list[Any] = [project_id]
+    params: list[Any] = [qblob, k, project_id]
     if item_type is not None:
         q += " AND c.item_type = ?"
         params.append(item_type)
@@ -407,7 +424,7 @@ def vector_search(conn: sqlite3.Connection, query_vec: list[float],
     if before is not None:
         q += " AND c.modified_date <= ?"
         params.append(before)
-    q += " ORDER BY v.distance ASC LIMIT ?"
+    q += " ORDER BY knn.distance ASC LIMIT ?"
     params.append(limit)
     return conn.execute(q, params).fetchall()
 
@@ -475,18 +492,27 @@ def count_items(conn: sqlite3.Connection, project_id: int) -> int:
 
 
 def indexed_item_ids(conn: sqlite3.Connection, project_id: int) -> set[int]:
-    """Return the set of item_ids that already have chunks indexed.
+    """Return the set of item_ids that already have VECTORS indexed.
 
-    Used by resume-mode sync to skip items that were fully indexed before an
-    interruption — only items WITHOUT chunks are re-fetched and re-embedded.
-    Reads from the ``chunks`` table (not ``items``) so an item that was
-    upserted (metadata only) but never got its chunks written is NOT skipped
-    (it still needs embedding). The ``idx_chunks_project`` index makes this a
-    cheap scan.
+    Used by resume-mode sync to skip items that were fully indexed (text +
+    FTS + vec) before an interruption — only items WITHOUT vectors are
+    re-fetched and re-embedded.
+
+    Reads from ``chunks_vec`` (the vector index), NOT ``chunks`` (the text
+    table). This is the critical distinction: ``replace_chunks`` writes
+    chunks + FTS + vec in one transaction, but if a prior sync was
+    interrupted after the chunks table write but before vec insertion (or
+    if vec insertion failed silently), the chunks table would have rows
+    while chunks_vec would not. Checking chunks_vec ensures we only skip
+    items whose vectors are truly present — otherwise resume would skip
+    items that lack vectors, leaving the vector index permanently incomplete
+    (vector search returns empty → zero recall).
     """
     return {
         row[0] for row in conn.execute(
-            "SELECT DISTINCT item_id FROM chunks WHERE project_id=?",
+            "SELECT DISTINCT c.item_id FROM chunks_vec v "
+            "JOIN chunks c ON c.chunk_id = v.chunk_id "
+            "WHERE c.project_id=?",
             (project_id,)
         )
     }

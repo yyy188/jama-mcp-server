@@ -1037,10 +1037,25 @@ class RAGPipeline:
                 rr_scores = [rrf_scores[cid] for cid in ordered]
 
             scored = sorted(zip(ordered, rr_scores),
-                            key=lambda x: x[1], reverse=True)[:top_k]
+                            key=lambda x: x[1], reverse=True)
+            # Deduplicate by item_id: a single item can have multiple chunks
+            # (description + test_steps) in the candidate pool, and without
+            # dedup they'd occupy multiple top_k slots — wasting result
+            # slots on the same item when the user wants diverse items. Keep
+            # only the highest-scoring chunk per item_id.
+            seen_items: set[int] = set()
+            deduped: list[tuple[str, float]] = []
+            for cid, score in scored:
+                item_id = rows[cid]["item_id"]
+                if item_id in seen_items:
+                    continue
+                seen_items.add(item_id)
+                deduped.append((cid, score))
+                if len(deduped) >= top_k:
+                    break
             return [_row_to_result(rows[cid], score,
                                    "rerank" if used_rerank else "rrf")
-                    for cid, score in scored if cid in rows]
+                    for cid, score in deduped if cid in rows]
         finally:
             conn.close()
 
