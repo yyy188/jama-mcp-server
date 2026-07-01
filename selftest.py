@@ -21,9 +21,86 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Unbuffered + line-buffered stdout so progress is visible in real time when
+# output is redirected to a file (the common case for background/monitored
+# runs). Without this, Python uses full block-buffering for non-tty stdout,
+# so a multi-minute self-test writes nothing until it finishes — making it
+# impossible to tell a hang from a healthy run via `tail`. reconfigure is a
+# no-op on streams that don't support it (older Pythons); fall back to flushing
+# in the helpers below regardless.
+try:
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+except Exception:
+    pass
+
+# Monotonic start time for relative progress timestamps (mm:ss).
+_T0 = time.monotonic()
+
+
+def _tlog(msg: str) -> None:
+    """Print a progress line with a relative mm:ss timestamp, flushed now.
+
+    Used by the long-running phases (sync, crash recovery, search) so a
+    background/monitored run shows live movement instead of going dark for
+    minutes. Prefixed with a leading space so it visually separates from the
+    PASS/FAIL block headers without being mistaken for a test result.
+    """
+    dt = time.monotonic() - _T0
+    mm, ss = divmod(int(dt), 60)
+    print(f"  [..{mm:02d}:{ss:02d}] {msg}", flush=True)
+
+
+class _JobPoller:
+    """Background thread that prints sync job progress while a long phase runs.
+
+    Wraps a blocking call (e.g. ``server._sync_project``) by polling the
+    ``sync_jobs`` row every few seconds and emitting a one-line progress
+    update (done/total + message), so the phase isn't a black box. Use as a
+    context manager; polling stops on exit.
+    """
+
+    def __init__(self, conn, job_id: str, label: str, interval: float = 5.0):
+        self._conn = conn
+        self._job_id = job_id
+        self._label = label
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="selftest-jobpoll")
+        self._thread.start()
+        return self
+
+    def _loop(self):
+        from db_setup import get_job
+        last = None
+        while not self._stop.wait(self._interval):
+            try:
+                row = get_job(self._conn, self._job_id)
+            except Exception:
+                continue
+            if row is None:
+                continue
+            cur = (row["status"], row["done"], row["total"], row["message"])
+            if cur != last:
+                last = cur
+                tot = row["total"] or "?"
+                _tlog(f"{self._label}: {row['status']} "
+                      f"{row['done']}/{tot} — {row['message'] or ''}")
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
 
 import config  # noqa: E402  (triggers .env load)
 from config import settings  # noqa: E402
@@ -262,8 +339,11 @@ def test_concurrent_sync(jama, project_id: int) -> None:
     job_id = f"selftest-sync-{_uuid.uuid4().hex[:8]}"
     create_job(conn, job_id, project_id, "init")
     t0 = time.time()
+    _tlog(f"concurrent sync: starting for project {project_id} "
+          f"({total} items)")
     try:
-        server._sync_project(project_id, job_id=job_id, incremental=False)
+        with _JobPoller(conn, job_id, "concurrent sync"):
+            server._sync_project(project_id, job_id=job_id, incremental=False)
     except Exception as exc:
         _fail("concurrent sync", f"raised: {exc}")
         conn.close()
@@ -303,14 +383,32 @@ def test_crash_recovery(project_id: int) -> None:
         conn.execute("DELETE FROM chunks_vec")
         conn.execute("DELETE FROM items WHERE project_id=?", (project_id,))
     before = get_project(conn, project_id)
+    _tlog(f"crash recovery: project {project_id} left INITIALIZING; "
+          f"running _resume_interrupted_syncs")
+    # Mirror main()'s startup order: reconcile stale (orphaned) jobs BEFORE
+    # resuming. A prior test run killed mid-sync (or a killed self-test
+    # process) leaves RUNNING job rows whose worker is gone forever; without
+    # reconcile, get_active_job_for_project would return those zombies and
+    # the poll loop below would wait on a job that never advances.
+    from db_setup import reconcile_stale_jobs
+    n = reconcile_stale_jobs(conn)
+    if n:
+        _tlog(f"crash recovery: reconciled {n} stale job(s) first")
     # Run the startup recovery function.
     server._resume_interrupted_syncs()
-    # Poll for completion (the recovery submits a background job).
-    for _ in range(40):
+    # Poll for completion (the recovery submits a background job). The resumed
+    # job re-runs model pre-download + pre-flight speed test + full re-sync;
+    # on a flaky link the speed test can retry a few times (each ~5-15s) and
+    # the reranker re-loads (~8s), so allow up to ~4 min. A genuine hang still
+    # fails the test — just not a transiently-slow network.
+    for i in range(80):
         time.sleep(3)
         p = get_project(conn, project_id)
         if p["status"] in ("READY", "ERROR"):
             break
+        if i % 3 == 0:  # emit a heartbeat roughly every ~9s
+            _tlog(f"crash recovery: still {p['status']} "
+                  f"({count_chunks(conn, project_id)} chunks so far)")
     after = get_project(conn, project_id)
     if before["status"] == "INITIALIZING" and after["status"] == "READY" \
             and count_chunks(conn, project_id) > 0:
@@ -359,6 +457,7 @@ def test_search_subqueries(project_id: int) -> None:
 
     try:
         rag = server.rag()
+        _tlog(f"search: probing with {probe!r} (first call may load reranker)")
         # (a) Caller supplies sub_queries (the Plan B happy path).
         r_sub = rag.search(project_id, probe,
                            sub_queries=[probe, f"{probe} requirement",

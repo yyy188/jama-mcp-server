@@ -16,14 +16,15 @@ between semantic search and structured metadata queries.
             │   server.py  (FastMCP + APScheduler + thread pool)          │
             │      │                                                       │
             │      ├── rag_pipeline.py  (Multi-Query + Hybrid + RRF +     │
-            │      │                       Qwen3-Reranker)                 │
+            │      │                       cross-encoder reranker)         │
             │      ├── jama_client.py   (OAuth2 + pagination + HTML clean)│
             │      └── db_setup.py      (SQLite + FTS5 + sqlite-vec)      │
             │                                                              │
             └──────────────────────────────────────────────────────────────┘
                          │                        │
-                  Jama REST API            Azure OpenAI embeddings
-                  (read-only GET)          (text-embedding-3-small)
+                  Jama REST API            Local CPU embeddings (default:
+                  (read-only GET)          bge-small-en-v1.5) + Azure OpenAI
+                                           (optional, text-embedding-3-small)
 ```
 
 ## Retrieval pipeline (`search_jama_semantics`)
@@ -38,10 +39,13 @@ between semantic search and structured metadata queries.
    + keyword recall (FTS5, BM25), each capped at `candidate_k`.
 3. **RRF fusion** — Reciprocal Rank Fusion merges all ranked lists into one
    candidate pool of ≤ `candidate_k` unique chunks.
-4. **Rerank** — local **Qwen3-Reranker-0.6B** (CPU, via `transformers`) scores
-   `(query, chunk)` pairs via the `P("yes")` token probability; top `top_k`
-   returned. If the model is unavailable, the pipeline gracefully falls back to
-   RRF scores. Model weights are fetched from the HuggingFace China mirror
+4. **Rerank** — a local **cross-encoder** (`cross-encoder/ms-marco-MiniLM-L-6-v2`,
+   ~80MB, CPU, ONNX via fastembed/onnxruntime) scores `(query, chunk)` pairs via
+   a sequence-classification head; top `top_k` returned. It runs on the SAME
+   onnxruntime as the bge embedding model — no torch/transformers dependency,
+   so the Windows `c10.dll`/WinError 1114 load failure is eliminated. If the
+   model is unavailable, the pipeline gracefully falls back to RRF scores.
+   Model weights are fetched from the HuggingFace China mirror
    (`HF_ENDPOINT=https://hf-mirror.com`) on first use, then served from cache.
 
 ## Reliability & crash recovery
@@ -88,24 +92,120 @@ Handles pagination internally, returns up to 20 core metadata records.
 ## Incremental sync
 
 On startup, APScheduler registers a job (every 2h by default) that reads the
-`projects` table for initialized `project_id` + `last_sync_time`, then walks
-Jama items whose `modifiedDate > last_sync_time`, re-cleans/re-chunks them and
-updates the FTS5 + sqlite-vec indexes. New items are added; modified items have
-their old chunks replaced atomically.
+`projects` table for projects in `READY` status (`INITIALIZING` is deliberately
+excluded — those are handled by crash recovery) along with their
+`last_sync_time`, then walks Jama items whose `modifiedDate > last_sync_time`,
+re-cleans/re-chunks them and updates the FTS5 + sqlite-vec indexes. New items
+are added; modified items have their old chunks replaced atomically. A project
+that already has an in-flight job is skipped so a scheduled sync never races a
+user-initiated one.
 
 ## Setup
 
+### Get the code
+
 ```bash
-# 1. Install (uses Aliyun mirror; GitHub-only deps fall back to PyPI)
+# Direct (if GitHub is reachable)
+git clone https://github.com/yyy188/jama-mcp-server.git jama
+cd jama
+
+# China mirror (if github.com is slow/blocked)
+git clone https://gh-proxy.com/https://github.com/yyy188/jama-mcp-server.git jama
+cd jama
+```
+
+### Recommended: `uv` (deterministic, reproducible)
+
+[`uv`](https://docs.astral.sh/uv/) is a single-binary Python package manager
+(~20 MB). Its lockfile (`uv.lock`) pins the *entire* dependency tree — every
+package and its transitive deps — so `uv sync` on a new machine produces the
+exact same environment, with no version-resolution surprises.
+
+```bash
+# 1. Install uv (one-time, ~20 MB single binary)
+#    Windows:  winget install astral-sh.uv
+#    macOS/Linux:  curl -LsSf https://astral.sh/uv/install.sh | sh
+#    (or: pip install uv)
+
+# 2. Sync dependencies from the lockfile (creates .venv, installs 116 packages)
+uv sync
+
+# 3. Configure
+cp .env.example .env        # then edit: fill in JAMA_URL / JAMA_CLIENT_ID / JAMA_CLIENT_SECRET
+
+# 4. Pre-download models (~150 MB ONNX, one-time)
+uv run python bootstrap.py
+
+# 5. Run
+uv run python server.py     # stdio (default) — local MCP client spawns it
+```
+
+### Alternative: `pip`
+
+```bash
 pip install -r requirements.txt
-
-# 2. Configure (interactive wizard writes .env, then validates deps + config,
-#    and optionally probes Jama/embedding connectivity with --self-test)
-python setup_wizard.py --self-test
-
-# 3. Run (stdio transport for an MCP client)
+cp .env.example .env        # fill in Jama credentials
+python bootstrap.py
 python server.py
 ```
+
+### Transports: stdio vs HTTP
+
+The server supports three transports, selected by `JAMA_MCP_TRANSPORT`:
+
+| Transport | Use case | Client connects via |
+|-----------|----------|---------------------|
+| `stdio` (default) | Local MCP client (Claude Desktop) spawns server as subprocess | stdin/stdout |
+| `streamable-http` | Remote client / Docker / shared server | `http://host:8000/mcp` |
+| `sse` | Older MCP clients that only support SSE | `http://host:8000/sse` |
+
+For HTTP/SSE mode, set `JAMA_MCP_HOST` (`0.0.0.0` for remote access) and
+`JAMA_MCP_PORT` (default `8000`):
+
+```bash
+# streamable-http (MCP new standard), listening on all interfaces
+JAMA_MCP_TRANSPORT=streamable-http JAMA_MCP_HOST=0.0.0.0 uv run python server.py
+# SSE (older clients)
+JAMA_MCP_TRANSPORT=sse JAMA_MCP_HOST=0.0.0.0 uv run python server.py
+```
+
+#### MCP client config (stdio, Claude Desktop example)
+
+```json
+{
+  "mcpServers": {
+    "jama-mcp": {
+      "command": "uv",
+      "args": ["run", "--directory", "/abs/path/to/jama", "python", "server.py"]
+    }
+  }
+}
+```
+
+#### MCP client config (streamable-http)
+
+Point your MCP client at `http://localhost:8000/mcp` (or the remote host:port).
+
+To (re)download just the models later without re-running the wizard:
+
+```bash
+uv run python bootstrap.py     # or: python bootstrap.py
+```
+
+The models live in `user/huggingface/` (project-local, ~150 MB: a ~130 MB
+ONNX embedding + ~80 MB ONNX cross-encoder reranker). Both run on onnxruntime
+via fastembed — CPU-only, no torch/transformers. The model files are plain
+data — portable across machines, so you can copy that folder from another
+machine to skip the download entirely.
+
+### Why pinned onnxruntime versions
+
+`onnxruntime` is pinned to **`1.20.1`** (or `1.21.1` on Python 3.13+) on
+purpose: 1.27.0 (what `fastembed` pulls on Python 3.13+) depends on the new
+VC++ Runtime absent on many Windows machines, causing `WinError 1114` DLL load
+failures. The pin protects the whole ML stack (embedding + reranker share this
+single runtime). If you upgrade it, re-test on a clean Windows machine without
+the latest VC++ Redistributable.
 
 After the server starts, the LLM client should call `bootstrap_models` (and poll
 `get_bootstrap_progress` every ~2 min) to pre-download the embedding + reranker
@@ -116,10 +216,12 @@ On startup the server logs a hint if the models aren't cached yet.
 
 Every MCP tool runs an offline **pre-flight check** before doing any work:
 Python dependencies, required env vars (JAMA_URL / JAMA_CLIENT_ID /
-JAMA_CLIENT_SECRET / EMBEDDING_BASE_URL / EMBEDDING_API_KEY) and the SQLite
-store. If anything is missing the tool returns a clear error dict with a
-`hint` instead of failing midway through a Jama API call. Configure via the
-wizard, or call the `configure_jama` / `validate_setup` tools at runtime.
+JAMA_CLIENT_SECRET — plus EMBEDDING_BASE_URL / EMBEDDING_API_KEY only when
+EMBEDDING_PROVIDER=azure; the default `local` CPU provider needs no embedding
+credentials) and the SQLite store. If anything is missing the tool returns a
+clear error dict with a `hint` instead of failing midway through a Jama API
+call. Configure via the wizard, or call the `configure_jama` / `validate_setup`
+tools at runtime.
 
 ### MCP client config (Claude Desktop example)
 
@@ -155,21 +257,22 @@ job plus its last init/reinit/sync run at any time with
 
 ## Model bootstrap
 
-The embedding model (~67MB, bge-small-en-v1.5) and Qwen3 reranker weights
-(~1.2GB) are **not bundled** — they download on first use. To keep the first
-sync from stalling on a model download, call `bootstrap_models` right after the
-server is configured. It downloads BOTH models **asynchronously** (a
+The embedding model (~130MB ONNX, bge-small-en-v1.5) and the cross-encoder
+reranker (~80MB) are **not bundled** — they download on first use. To keep the
+first sync from stalling on a model download, call `bootstrap_models` right
+after the server is configured. It downloads BOTH models **asynchronously** (a
 `kind="bootstrap"` job in `sync_jobs`, run on the same thread pool as syncs) and
 returns a `job_id` immediately.
 
 - `bootstrap_models()` — start the async pre-download (no-op per model if
   already cached). Reentrancy-guarded: a second call while one is RUNNING
   returns the existing `job_id`.
-- `get_bootstrap_progress(job_id)` — poll every ~2 min. While the 1.2GB reranker
-  downloads, `message` carries live byte progress
-  (e.g. `"Downloading reranker weights: 680/1200 MB"`); the ~67MB embedding
-  model downloads via fastembed (no byte callback) so it reports phase
-  transitions only. `status` → `DONE` (both cached) or `ERROR`.
+- `get_bootstrap_progress(job_id)` — poll every ~2 min. Progress is
+  **phase-based, not live bytes**: the reranker downloads via
+  `snapshot_download` and the embedding via fastembed, neither of which gives a
+  per-chunk byte callback, so `message` reports phase transitions (e.g.
+  "Downloading reranker model (...)" → "Reranker model ready") rather than byte
+  counts. `status` → `DONE` (both cached) or `ERROR`.
 
 On startup, if either model isn't cached, the server logs a hint to call
 `bootstrap_models`. The sync-time `ensure_downloaded` calls remain as a fallback
@@ -222,6 +325,8 @@ so the monitor never shows a phantom in-flight job.
 | `rag_pipeline.py` | chunking, embeddings, Multi-Query, hybrid recall, RRF, rerank |
 | `server.py` | MCP tools, async jobs, APScheduler incremental sync, pre-flight guards |
 | `preflight.py` | offline dependency + config + storage validation |
+| `net_guard.py` | pre-download bandwidth speed test (`NetworkTooSlowError`) |
+| `bootstrap.py` | foreground model pre-download CLI (`python bootstrap.py`) |
 | `setup_wizard.py` | interactive configuration wizard (`python setup_wizard.py`) |
 | `selftest.py` | end-to-end self-test suite (`python selftest.py`) |
 | `.env.example` | template for environment configuration |
@@ -243,6 +348,7 @@ so the monitor never shows a phantom in-flight job.
 - `list_jama_releases(project_id)` — project releases/versions.
 - `list_jama_test_runs(project_id?, test_cycle_id?)` — test runs.
 - `list_jama_item_types()` — tenant item types (id → name).
+- `find_jama_item_type_by_name(name, exact?)` — find item types by display name → get the id needed by item_type filters.
 - `query_jama_endpoint(path, params?, all_pages?)` — generic read-only GET escape hatch.
 
 **RAG / retrieval / sync monitoring**
@@ -252,22 +358,27 @@ so the monitor never shows a phantom in-flight job.
 - `reinit_jama_project(project_id)` — async full re-sync of an already-initialized project.
 - `get_sync_progress(job_id)` — poll one init/reinit/sync job's progress.
 - `get_sync_status(project_id)` — project monitor: in-flight job + last init/reinit/sync run + process metrics.
-- `search_jama_semantics(project_id, query, ...)` — Multi-Query + hybrid + RRF + Qwen3 rerank.
+- `search_jama_semantics(project_id, query, ...)` — Multi-Query + hybrid + RRF + cross-encoder rerank.
 - `query_jama_native_metadata(project_id, ...)` — exact-match metadata via `/abstractitems`.
 
 ## Verified
 
-All components self-tested against the live Jama instance and embedding API:
-OAuth + paginated fetch, HTML→text cleaning, Test Case step rendering,
-item-type mapping, DB schema (FTS5 + vec0), full RAG search, async init with
-progress polling, incremental sync (0 new items), native metadata filters
-(item_type / status / keyword / document_key), APScheduler startup, MCP stdio
-handshake, and error paths (bad project id, unknown job, nonexistent project).
+All components self-tested against the live Jama instance and the local CPU
+embedding backend: OAuth + paginated fetch, HTML→text cleaning, Test Case step
+rendering, item-type mapping, DB schema (FTS5 + vec0), full RAG search, async
+init with progress polling, incremental sync (0 new items), concurrent
+download + batched embed, crash recovery (INITIALIZING → auto-resynced READY),
+native metadata filters (item_type / status / keyword / document_key),
+APScheduler startup, MCP stdio handshake, and error paths (bad project id,
+unknown job, nonexistent project, missing args).
 
-The **Qwen3-Reranker-0.6B** was downloaded from the HuggingFace China mirror
-(`hf-mirror.com`) and loaded on CPU; verified it produces non-zero relevance
-scores with correct ordering (related=0.55 > unrelated=0.0002) and that the
-end-to-end RAG search returns `strategy=rerank` results. **LlamaIndex** is the
+The **cross-encoder reranker** (ms-marco-MiniLM-L-6-v2, ONNX port via
+fastembed) was downloaded from the HuggingFace China mirror (`hf-mirror.com`)
+and loaded on onnxruntime (no torch); verified it produces non-zero relevance
+scores with correct ordering (a related document scores significantly higher
+than an unrelated one) and that the end-to-end RAG search returns
+`strategy=rerank` results. Scores are the model's raw logits (may be
+negative) — only the relative order is meaningful for re-ranking. **LlamaIndex** is the
 primary RAG framework: `SentenceSplitter` + `Document`/`TextNode` for chunking.
 Multi-Query expansion is performed by the MCP LLM client and passed to the
 pipeline via `search(sub_queries=...)`; when omitted, deterministic lexical

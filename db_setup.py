@@ -256,9 +256,19 @@ def get_project(conn: sqlite3.Connection, project_id: int) -> sqlite3.Row | None
 
 
 def list_initialized_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Projects eligible for scheduled incremental sync (status=READY only).
+
+    INITIALIZING is deliberately EXCLUDED: a project in that state was either
+    just kicked off by init/reinit (its own job row drives it) or left stuck by
+    a crash (handled by ``_resume_interrupted_syncs`` on startup). Letting the
+    scheduler also submit a sync for it would race the in-progress/recovery
+    worker on the per-project lock — the loser queues behind the lock and burns
+    a worker slot, and on a stuck project the scheduled sync would never
+    advance past INITIALIZING anyway. Only READY projects have a meaningful
+    ``last_sync_time`` to increment from.
+    """
     return conn.execute(
-        "SELECT * FROM projects WHERE status IN ('READY','INITIALIZING') "
-        "ORDER BY project_id"
+        "SELECT * FROM projects WHERE status = 'READY' ORDER BY project_id"
     ).fetchall()
 
 
@@ -447,6 +457,20 @@ def fetch_chunks_by_ids(conn: sqlite3.Connection,
 def count_chunks(conn: sqlite3.Connection, project_id: int) -> int:
     return conn.execute(
         "SELECT COUNT(*) FROM chunks WHERE project_id=?", (project_id,)
+    ).fetchone()[0]
+
+
+def count_items(conn: sqlite3.Connection, project_id: int) -> int:
+    """Total indexed items for a project (the ``items`` table row count).
+
+    Used to report a project's true ``item_count`` after a sync. A full init
+    indexes every item, but an incremental sync only re-processes MODIFIED
+    items — so the per-run ``done`` counter is NOT the project total. Reading
+    the persisted item count keeps ``get_sync_status`` accurate after both
+    kinds of run.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM items WHERE project_id=?", (project_id,)
     ).fetchone()[0]
 
 

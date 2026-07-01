@@ -9,9 +9,13 @@ Retrieval chain (``search`` method):
                    recall (FTS5), each limited to ``candidate_k``.
 3. RRF fusion    - Reciprocal Rank Fusion merges all candidate lists into one
                    ranked list of <= ``candidate_k`` unique chunks.
-4. Rerank        - local Qwen3-Reranker-0.6B scores (query, chunk) pairs; the
-                   top ``top_k`` are returned. If the model is unavailable and
-                   ``allow_fallback`` is set, RRF scores are used directly.
+4. Rerank        - a local cross-encoder (default ms-marco-MiniLM-L-6-v2,
+                   ONNX port via fastembed/onnxruntime) scores (query, chunk)
+                   pairs; the top ``top_k`` are returned. If the model is
+                   unavailable and ``allow_fallback`` is set, RRF scores are
+                   used directly. Runs on the SAME onnxruntime as the bge
+                   embedding model — no torch/transformers dependency, so the
+                   Windows c10.dll/WinError 1114 load failure is eliminated.
 """
 from __future__ import annotations
 
@@ -190,7 +194,7 @@ class EmbeddingClient:
             return []
         if concurrency <= 1 or len(texts) <= self._batch:
             return self.embed_texts(texts)
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         # Slice into batches; record (start_index, batch) so we can place
         # each result back at the right position.
@@ -199,9 +203,6 @@ class EmbeddingClient:
             slices.append((i, texts[i:i + self._batch]))
 
         out: list[list[float] | None] = [None] * len(texts)
-
-        def _embed_slice(start_batch: list[str], batch_texts: list[str]) -> None:
-            return start_batch, batch_texts
 
         def _do(batch_texts: list[str]) -> list[list[float]]:
             r = self._sess.post(self._url, headers=self._headers,
@@ -216,14 +217,32 @@ class EmbeddingClient:
 
         with ThreadPoolExecutor(max_workers=concurrency,
                                 thread_name_prefix="embed") as ex:
-            futures = {ex.submit(_do, bt): (start, bt) for start, bt in slices}
-            for fut in futures:
-                start, bt = futures[fut]
+            future_to_meta = {ex.submit(_do, bt): (start, len(bt))
+                              for start, bt in slices}
+            # Collect as_completed so one slow batch can't block collection of
+            # already-finished ones (iterating futures in submission order would
+            # serialize the wait on the first slow batch).
+            for fut in as_completed(future_to_meta):
+                start, n = future_to_meta[fut]
                 embs = fut.result()
+                # A short response would silently leave gaps; the old code
+                # filtered them out with `if v is not None`, dropping the
+                # missing slots and misaligning chunks<->embeddings (writing
+                # half-indexed vectors into the vec table). Raise loudly so the
+                # batch fails instead of corrupting the index.
+                if len(embs) != n:
+                    raise RuntimeError(
+                        f"Embedding API returned {len(embs)} vectors for {n} "
+                        f"inputs (batch at offset {start}); aborting to avoid "
+                        f"chunk/embedding misalignment.")
                 for j, e in enumerate(embs):
                     out[start + j] = e
-        # All positions filled (batches are contiguous); cast away None.
-        return [v for v in out if v is not None]
+        # Every slot is filled (batches are contiguous and count-checked above);
+        # guard against a logic error rather than silently filtering Nones.
+        if any(v is None for v in out):
+            raise RuntimeError(
+                "Internal error: embedding result has unfilled slots.")
+        return out  # type: ignore[return-value]
 
 
 # --------------------------------------------------------------------------- #
@@ -234,6 +253,11 @@ class EmbeddingClient:
 # retrieval recall against documents indexed without the prefix. Documents are
 # embedded raw; only queries get the prefix.
 _BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
+# CPU-only policy: fastembed's TextEmbedding / TextCrossEncoder default
+# ``cuda`` to ``Device.AUTO`` (which would use a GPU if present). We ALWAYS pass
+# ``cuda=False`` to force the onnxruntime CPU backend — this server is
+# CPU-only by design, so every fastembed construction below hardcodes it.
 
 
 class LocalEmbeddingClient:
@@ -458,7 +482,7 @@ class LocalEmbeddingClient:
     def ensure_downloaded(self) -> None:
         """Pre-download the embedding model without loading it.
 
-        Called at the very start of project sync so the (64 MB) download
+        Called at the very start of project sync so the (~130MB ONNX) download
         happens before any indexing work, alongside the reranker weights. If
         the model is already cached this is a fast no-op. A failure here is
         non-fatal: the actual load (and error) is deferred to first embed.
@@ -598,22 +622,45 @@ def rrf_fuse(ranked_lists: list[list[str]], k: int = 60) -> list[tuple[str, floa
 
 
 # --------------------------------------------------------------------------- #
-# Qwen3 Reranker (lazy-loaded singleton)
+# Reranker (lazy-loaded singleton, ONNX via fastembed)
 # --------------------------------------------------------------------------- #
-class QwenReranker:
-    """Local Qwen3-Reranker-0.6B scorer (CPU).
+# Maps a configured torch-style model name to its fastembed ONNX equivalent.
+# fastembed's TextCrossEncoder pulls ONNX weights (not safetensors/pytorch_model),
+# which run on onnxruntime — the SAME runtime already used for local embeddings.
+# This lets the reranker load with ZERO torch/transformers dependency, so the
+# WinError 1114 (c10.dll / VC++ Runtime) failures that torch triggers on
+# Windows are eliminated entirely. A user's existing .env that names the
+# torch model (``cross-encoder/...``) keeps working — it's transparently
+# remapped here, so no config edit is required to migrate.
+_ONNX_RERANKER_MAP = {
+    "cross-encoder/ms-marco-MiniLM-L-6-v2": "Xenova/ms-marco-MiniLM-L-6-v2",
+}
 
-    Loads lazily on first use so the MCP server starts fast and so a missing
-    model never blocks startup. With ``allow_fallback`` the pipeline degrades
-    to RRF-only scoring if loading fails.
+
+class Reranker:
+    """Local cross-encoder reranker scorer (CPU, ONNX via fastembed).
+
+    Default model: ``cross-encoder/ms-marco-MiniLM-L-6-v2`` (transparently
+    remapped to its ONNX port ``Xenova/ms-marco-MiniLM-L-6-v2``, ~80MB). Loads
+    lazily on first use so the MCP server starts fast and a missing model never
+    blocks startup. With ``allow_fallback`` the pipeline degrades to RRF-only
+    scoring if loading fails.
+
+    Replaces the prior torch/transformers implementation: the cross-encoder now
+    runs on onnxruntime (the same runtime the bge embedding model uses), so
+    torch/transformers are no longer dependencies and the Windows
+    ``c10.dll``/WinError 1114 load failure is eliminated. Scoring returns the
+    model's RAW logits (which may be negative) — only the RELATIVE order
+    matters for re-ranking, so the absolute range is intentionally not
+    normalized to 0..1.
     """
 
-    _instance: "QwenReranker | None" = None
+    _instance: "Reranker | None" = None
     _lock = threading.Lock()
-    # Serializes the manual weights download so a concurrent bootstrap + sync
-    # can't both write the same dest file (cache corruption). Held only across
-    # the download section, with a re-check inside (double-checked locking).
-    _weights_lock = threading.Lock()
+    # Serializes the ONNX weights download so a concurrent bootstrap + sync
+    # can't both write the same cache files (corruption). Held only across the
+    # download section, with a re-check inside (double-checked locking).
+    _download_lock = threading.Lock()
 
     def __new__(cls):
         with cls._lock:
@@ -627,226 +674,234 @@ class QwenReranker:
             return
         self._initialized = True
         self._cfg = settings.reranker
-        self._tokenizer = None
-        self._model = None
+        self._model = None  # fastembed.TextCrossEncoder, lazy
         self._load_error: str | None = None
+        self._hf_repo: str | None = None  # cached by _resolve_hf_repo
 
-    def ensure_downloaded(self, progress_callback=None) -> None:
-        """Pre-download reranker weights without loading the model.
+    # ----- model resolution --------------------------------------------- #
+    def _resolve_model(self) -> str:
+        """The fastembed ONNX model name for the configured reranker.
 
-        Called during project sync so the (1.2 GB) download happens up front,
-        alongside the embedding model — not deferred to the first search
-        (where a download failure would surprise the user mid-query). If the
-        weights are already cached this is a no-op. A failure here is
-        non-fatal: the reranker stays unloaded and search degrades to RRF.
-
-        ``progress_callback(received, expected)`` is forwarded to the
-        safetensors download so the bootstrap monitor can report live bytes.
+        Transparently maps a legacy torch-style name (e.g.
+        ``cross-encoder/ms-marco-MiniLM-L-6-v2``) to its ONNX port
+        (``Xenova/ms-marco-MiniLM-L-6-v2``) so a user's existing .env keeps
+        working after the torch→ONNX migration. Names not in the map pass
+        through unchanged (custom ONNX reranker repos are honored as-is).
         """
-        if self._model is not None or self._load_error is not None:
-            return
+        return _ONNX_RERANKER_MAP.get(self._cfg.model_name, self._cfg.model_name)
+
+    def _resolve_hf_repo(self) -> str:
+        """The HF repo fastembed actually pulls ONNX weights from.
+
+        fastembed's ``TextCrossEncoder`` downloads from the repo registered in
+        its model registry for the configured model (usually the model name
+        itself, e.g. ``Xenova/...``). The cache directory is named after THAT
+        repo, so cache-detection and the download speed-test probe must use it.
+        Falls back to the resolved model name if the registry can't be read.
+        """
+        cached = getattr(self, "_hf_repo", None)
+        if cached is not None:
+            return cached
+        model_name = self._resolve_model()
         try:
-            self._ensure_weights_downloaded(progress_callback=progress_callback)
-            log.info("Qwen3-Reranker weights ready (pre-downloaded during sync).")
-        except Exception as exc:
-            log.warning("Qwen3-Reranker pre-download failed (%s); "
-                        "will retry on first search or fall back to RRF.", exc)
+            from fastembed.rerank.cross_encoder import TextCrossEncoder
+            model_meta = next(
+                (m for m in TextCrossEncoder.list_supported_models()
+                 if m["model"] == model_name), None)
+            repo = (model_meta or {}).get("sources", {}).get("hf", model_name)
+        except Exception:
+            repo = model_name
+        self._hf_repo = repo
+        return repo
+
+    def _cache_dir(self) -> str:
+        """fastembed cache root — project-local user/huggingface for portability."""
+        from config import USER_DIR
+        return os.environ.get("HF_HOME", str(USER_DIR / "huggingface"))
+
+    # ----- model presence + download ------------------------------------ #
+    def _model_present(self) -> bool:
+        """True if the ONNX reranker model is already cached locally.
+
+        fastembed caches under ``<cache>/models--<org>--<name>`` (hf-style)
+        and/or ``<cache>/models/<org>/<name>`` (fastembed-style), named after
+        the REAL hf repo it pulls from. Probe both layouts and treat presence
+        of any ``.onnx`` file as "downloaded" — mirrors
+        ``LocalEmbeddingClient._model_present``.
+        """
+        repo = self._resolve_hf_repo()
+        cache = self._cache_dir()
+        candidates = [
+            os.path.join(cache, "models--" + repo.replace("/", "--")),
+            os.path.join(cache, "models", repo),
+        ]
+        for c in candidates:
+            if os.path.isdir(c):
+                for _dirpath, _dirs, files in os.walk(c):
+                    if any(f.endswith(".onnx") for f in files):
+                        return True
+        return False
+
+    def _download_model(self) -> None:
+        """Download the ONNX reranker model via fastembed, China mirror first.
+
+        Sets ``HF_ENDPOINT`` to the mirror before invoking fastembed (which
+        uses huggingface_hub under the hood and honours that env var). Runs a
+        pre-flight speed test against the mirror; if it's below the configured
+        floor or unreachable, switches to the global endpoint and retries. If
+        both fail, raises ``RuntimeError`` with an actionable message.
+
+        Mirrors ``LocalEmbeddingClient._download_model`` — the download path is
+        identical for embedding and reranker models (both go through fastembed).
+        """
+        from net_guard import speed_test, NetworkTooSlowError
+        from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+        with self._download_lock:
+            if self._model_present():
+                log.info("Reranker model cached by a concurrent download; "
+                         "skipping.")
+                return
+            hf_repo = self._resolve_hf_repo()
+            model_name = self._resolve_model()
+
+            mirrors = [
+                ("China mirror", "https://hf-mirror.com"),
+                ("HuggingFace (global)", "https://huggingface.co"),
+            ]
+            # Reuse the embedding download floor (same kind of ~80-130MB file).
+            min_bps = settings.embedding.download_min_bps
+            probe_path = f"{hf_repo}/resolve/main/config.json"
+
+            last_err: str | None = None
+            for label, endpoint in mirrors:
+                os.environ["HF_ENDPOINT"] = endpoint
+                probe_url = f"{endpoint}/{probe_path}"
+                try:
+                    bps = speed_test(probe_url, min_bytes_per_sec=min_bps,
+                                     timeout=20, label=f"rr-{label}")
+                    log.info("Reranker mirror %s OK: %.0f bytes/s", label, bps)
+                except NetworkTooSlowError as exc:
+                    last_err = f"{label} ({endpoint}): {exc}"
+                    log.warning("Reranker mirror %s too slow/unreachable: %s",
+                                label, exc)
+                    continue
+                # Mirror is fast enough — trigger the actual download by
+                # constructing TextCrossEncoder (it downloads on first use).
+                try:
+                    log.info("Downloading %s (ONNX from %s) via %s ...",
+                             model_name, hf_repo, label)
+                    ce = TextCrossEncoder(
+                        model_name=model_name,
+                        cache_dir=self._cache_dir(),
+                        cuda=False,
+                    )
+                    # Force the actual model load (download + ONNX init) now so
+                    # a download failure surfaces here, not on the first rerank.
+                    _ = list(ce.rerank("warmup", ["x"]))
+                    self._model = ce
+                    log.info("Local reranker model ready (%s).", model_name)
+                    return
+                except Exception as exc:
+                    last_err = f"{label} download failed: {exc}"
+                    log.warning("Reranker download from %s failed: %s", label, exc)
+                    continue
+
+            # Both mirrors failed.
+            self._load_error = (
+                f"Could not download reranker model {model_name} (ONNX source "
+                f"{hf_repo}) from any mirror. Last error: {last_err}. Check "
+                f"network connectivity or pre-download the model manually into "
+                f"{self._cache_dir()}.")
+            raise RuntimeError(self._load_error)
 
     def _load(self) -> bool:
+        """Load the model (cached or freshly downloaded). True on success."""
         if self._model is not None:
             return True
         if self._load_error is not None:
             return False
         try:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            log.info("Loading Qwen3-Reranker %s on %s ...",
-                     self._cfg.model_name, self._cfg.device)
-            # Ensure model weights are present locally. On first use this runs
-            # a pre-flight speed test against the HF mirror and downloads the
-            # safetensors with resume+stall retry; aborts with a clear network
-            # error if the mirror is too slow instead of hanging. Returns the
-            # local path to load from (cached snapshot or the manual download
-            # dir), or None to load by model name from the HF cache.
-            load_from = self._ensure_weights_downloaded()
-            src = load_from or self._cfg.model_name
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                src, trust_remote_code=True)
-            # Load in bf16 (half the memory of fp32; modern CPUs support it via
-            # AVX512_BF16/AMX) with low_cpu_mem_usage to avoid a transient 2x
-            # peak while the weights are materialized. fp32 was ~2.4 GB; bf16
-            # is ~1.2 GB, leaving headroom for the forward-pass activations.
-            self._model = AutoModelForCausalLM.from_pretrained(
-                src, trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                low_cpu_mem_usage=True).to(self._cfg.device).eval()
-            log.info("Qwen3-Reranker loaded.")
-            return True
+            if self._model_present():
+                log.info("Loading cached local reranker model %s ...",
+                         self._resolve_model())
+                from fastembed.rerank.cross_encoder import TextCrossEncoder
+                self._model = TextCrossEncoder(
+                    model_name=self._resolve_model(),
+                    cache_dir=self._cache_dir(),
+                    cuda=False,
+                )
+                _ = list(self._model.rerank("warmup", ["x"]))
+                log.info("Local reranker model ready.")
+                return True
+            self._download_model()
+            return self._model is not None
         except Exception as exc:
             self._load_error = str(exc)
-            log.warning("Qwen3 reranker unavailable (%s); "
-                        "RRF fallback will be used.", exc)
+            log.error("Local reranker model unavailable: %s", exc)
             return False
 
-    def _manual_weights_path(self) -> tuple[str, str]:
-        """Local ``(dest_dir, model.safetensors path)`` for the manual download.
+    def ensure_downloaded(self, progress_callback=None) -> None:
+        """Pre-download the ONNX reranker model without loading it.
 
-        Used when the HF-cache fast path fails: weights are fetched into a
-        project-local snapshot dir so transformers can load fully offline.
-        Centralised so cache-detection (``weights_cached``) and the download
-        path can't drift apart.
+        Called during project sync so the (~80MB) download happens up front,
+        alongside the embedding model — not deferred to the first search
+        (where a download failure would surprise the user mid-query). If the
+        model is already cached this is a no-op. A failure here is non-fatal:
+        the reranker stays unloaded and search degrades to RRF.
+
+        ``progress_callback(received, expected)`` is forwarded for API
+        compatibility with the bootstrap monitor; fastembed gives no per-chunk
+        byte callback, so it is only invoked once at completion (not live).
         """
-        import os
-        from config import USER_DIR
-        cache_dir = os.environ.get("HF_HOME", str(USER_DIR / "huggingface"))
-        dest_dir = os.path.join(cache_dir, "hub",
-                                "models--" + self._cfg.model_name.replace("/", "--"),
-                                "snapshots", "manual")
-        return dest_dir, os.path.join(dest_dir, "model.safetensors")
+        if self._model is not None or self._load_error is not None:
+            return
+        try:
+            self._download_model()
+            if progress_callback is not None:
+                # fastembed gives no byte callback; report completion.
+                try:
+                    progress_callback(1, 1)
+                except Exception:
+                    pass
+            log.info("Reranker model ready (pre-downloaded during sync).")
+        except Exception as exc:
+            log.warning("Reranker pre-download failed (%s); "
+                        "will retry on first search or fall back to RRF.", exc)
 
     def weights_cached(self) -> bool:
-        """True if the reranker weights are already on disk (lightweight, no network).
+        """True if the reranker model is already on disk (lightweight, no network).
 
-        Checks only the manual snapshot dir — the location ``_ensure_weights_downloaded``
-        writes to when the HF-cache fast path fails (common on this network).
-        A false negative is harmless: ``bootstrap_models`` would re-download and
+        Probes for the ONNX model file under the fastembed cache layouts. A
+        false negative is harmless: ``bootstrap_models`` would re-download and
         then no-op. Used by the startup hint, not by the load path.
         """
         if self._model is not None:
             return True
-        import os
-        _dest_dir, dest = self._manual_weights_path()
-        return os.path.exists(dest) and os.path.getsize(dest) > 0
-
-    def _ensure_weights_downloaded(self, progress_callback=None) -> str | None:
-        """Make sure Qwen3-Reranker weights are cached locally.
-
-        Returns the local directory to load from, or None if the model is
-        already in the HF cache (load by model name). If the weights aren't
-        cached, run a pre-flight speed test against the HF mirror and download
-        the safetensors with resume + stall retry into a local dir (with the
-        tokenizer/config files copied alongside) so transformers can load
-        offline. Raises ``NetworkTooSlowError`` on a slow/failed mirror.
-
-        The manual download is serialized by ``_weights_lock`` with a re-check
-        inside, so a concurrent bootstrap + sync can't both write the same dest.
-        """
-        import os
-        from huggingface_hub import hf_hub_download
-        from net_guard import (NetworkTooSlowError, download_with_retry,
-                               speed_test)
-
-        cfg = self._cfg
-        # Fast path: weights already in the HF cache -> load by model name.
-        # (hf_hub_download is internally locked by huggingface_hub, so concurrent
-        # callers here are safe.)
-        try:
-            path = hf_hub_download(repo_id=cfg.model_name,
-                                   filename="model.safetensors")
-            if os.path.getsize(path) > 0:
-                return None  # use model_name; transformers resolves the cache
-        except Exception:
-            pass  # not cached yet — fall through to guarded manual download
-
-        endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
-        url = (f"{endpoint.rstrip('/')}/{cfg.model_name}/resolve/main/"
-               f"model.safetensors")
-        small_files = ("config.json", "tokenizer.json",
-                       "tokenizer_config.json", "vocab.json", "merges.txt",
-                       "chat_template.jinja")
-        # Manual download path — serialized. Re-check the local cache AFTER
-        # acquiring the lock: another thread (e.g. bootstrap while a sync also
-        # calls ensure_downloaded) may have just finished writing the weights,
-        # in which case we skip the network entirely. We MUST check before the
-        # speed test so a transient network blip doesn't degrade to RRF when the
-        # model is fully present on disk.
-        with self._weights_lock:
-            dest_dir, dest = self._manual_weights_path()
-            if (os.path.exists(dest) and os.path.getsize(dest) > 0
-                    and all(os.path.exists(os.path.join(dest_dir, f))
-                            and os.path.getsize(os.path.join(dest_dir, f)) > 0
-                            for f in small_files)):
-                log.info("Qwen3-Reranker weights cached locally at %s; "
-                         "skipping network check.", dest_dir)
-                return dest_dir
-            # Pre-flight speed test against the mirror (1 MB probe). Aborts with
-            # a clear network error if the mirror is too slow.
-            speed_test(url, min_bytes_per_sec=cfg.hf_min_bytes_per_sec,
-                       timeout=cfg.hf_speed_test_timeout, label="hf-mirror")
-            # Download weights (resumable, stall-retried) into a local snapshot
-            # dir under the project-local HF cache (user/huggingface/hub/...).
-            os.makedirs(dest_dir, exist_ok=True)
-            download_with_retry(url, dest,
-                                min_bytes_per_sec=cfg.hf_min_bytes_per_sec,
-                                max_retries=cfg.hf_download_retries,
-                                label="qwen3-reranker",
-                                progress_callback=progress_callback)
-            # Fetch the small tokenizer/config files into the same snapshot dir
-            # so AutoTokenizer/AutoModel can load fully offline. These are tiny
-            # (<15MB total), so download directly by URL with light retry rather
-            # than relying on hf_hub_download (which may HEAD-fail here).
-            for fname in small_files:
-                link = os.path.join(dest_dir, fname)
-                if os.path.exists(link) and os.path.getsize(link) > 0:
-                    continue
-                furl = (f"{endpoint.rstrip('/')}/{cfg.model_name}/resolve/main/"
-                        f"{fname}")
-                try:
-                    download_with_retry(furl, link,
-                                        min_bytes_per_sec=1_000,  # tiny files
-                                        max_retries=cfg.hf_download_retries,
-                                        chunk_timeout=20,
-                                        label=f"qwen3-{fname}")
-                except Exception as exc:
-                    log.warning("Could not fetch %s: %s", fname, exc)
-            return dest_dir
+        return self._model_present()
 
     def rerank(self, query: str, texts: list[str],
                batch_size: int | None = None) -> list[float]:
-        """Return relevance scores (higher = more relevant)."""
+        """Return relevance scores (higher = more relevant).
+
+        ``batch_size`` is accepted for API compatibility but ignored — the
+        ONNX session batches internally. Scores are the model's RAW logits
+        (may be negative); only the relative order is meaningful for
+        re-ranking, so they are intentionally not normalized to 0..1.
+        """
         if not texts:
             return []
         if not self._load():
             return [0.0] * len(texts)
         try:
-            return self._score(query, texts, batch_size or self._cfg.batch_size)
+            # fastembed's TextCrossEncoder.rerank(query, documents) returns
+            # an iterator of raw relevance logits (one per document). The
+            # cross-encoder scores (query, doc) pairs directly via a sequence-
+            # classification head — far cheaper than a causal-LM approach.
+            return [float(s) for s in self._model.rerank(query, texts)]
         except Exception as exc:
             log.warning("Reranker scoring failed (%s); using zeros.", exc)
             return [0.0] * len(texts)
-
-    def _score(self, query: str, texts: list[str], batch_size: int) -> list[float]:
-        import torch
-        # Qwen3-Reranker prompt format (official): prefix tokens mark
-        # query/document boundaries, and relevance = P("yes") from the
-        # token-scored last position.
-        prefix = ("<|im_start|>system\nJudge whether the Document meets the "
-                  "requirements based on the Query and only answer with yes "
-                  "or no.<|im_end|>\n<|im_start|>user\n")
-        suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        yes_id = self._tokenizer.convert_tokens_to_ids("yes")
-        no_id = self._tokenizer.convert_tokens_to_ids("no")
-        scores: list[float] = []
-        with torch.no_grad():
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
-                prompts = [
-                    f"{prefix}\nQuery: {query}\nDocument: {t}\n{suffix}"
-                    for t in batch
-                ]
-                tok = self._tokenizer(prompts, padding=True, truncation=True,
-                                      max_length=self._cfg.max_length,
-                                      return_tensors="pt").to(self._cfg.device)
-                # logits_to_keep=1: only compute logits for the LAST token
-                # position. Without this, the model materializes a full
-                # [batch, seq_len, vocab(~152k)] tensor (~5 GB at batch=16,
-                # seq=512, fp32) — the root cause of the prior OOM. We only
-                # need P("yes") at the final position, so 1 is sufficient and
-                # cuts that tensor by ~seq_len× (hundreds-fold).
-                out = self._model(**tok, logits_to_keep=1)
-                logits = out.logits[:, -1, :]
-                yes = torch.softmax(logits, dim=-1)[:, yes_id]
-                scores.extend(yes.tolist())
-        return scores
 
 
 # --------------------------------------------------------------------------- #
@@ -862,7 +917,17 @@ class RAGPipeline:
         else:
             self.embedder = EmbeddingClient()
         self.expander = MultiQueryExpander(n=3)
-        self.reranker = QwenReranker()
+        self.reranker = Reranker()
+        # Per-search warnings surfaced to the caller (e.g. reranker load
+        # failed -> RRF fallback). Reset at the start of each `search`;
+        # read by `search_jama_semantics` so the LLM/user can see silent
+        # degradations instead of just a changed `strategy` field.
+        self.last_warnings: list[str] = []
+        # The sub-queries actually used for the most recent `search` (caller-
+        # supplied after normalization, or the lexical-fallback variants).
+        # Read by `search_jama_semantics` to echo the real variants used, so
+        # the lexical-fallback path reports them instead of just [query].
+        self.last_sub_queries: list[str] = []
 
     # ----- indexing ------------------------------------------------------ #
     def embed_chunks(self, chunks: list[dict]) -> list[list[float]]:
@@ -872,14 +937,17 @@ class RAGPipeline:
         """Embed a flat list of chunks, packing them into full API batches.
 
         Unlike calling ``embed_chunks`` once per item (which underfills each
-        HTTP request when items have only 1-3 chunks), this batches across
+        embedding request when items have only 1-3 chunks), this batches across
         items: it walks the whole chunk list in ``batch_size`` slices and
         issues embedding requests for each slice. For a project with ~1.4
-        chunks/item and ``batch_size=64`` this cuts the number of HTTP round
-        trips ~45x, turning minutes of serial network wait into seconds.
+        chunks/item and ``batch_size=32`` this cuts the number of embedding
+        round trips ~45x, turning minutes of serial wait into seconds.
 
-        When ``EMBEDDING_CONCURRENCY > 1`` (default 4) the batches are fired
-        concurrently, cutting indexing wall-time a further ~3-4x.
+        Concurrency: for the ``azure`` provider (``EMBEDDING_CONCURRENCY``>1,
+        default 2) the batches are fired concurrently, cutting wall-time a
+        further ~3-4x. For the default ``local`` CPU provider concurrency is
+        ignored — a single ONNX session already saturates the capped threads,
+        so serial batched embed is both the correct and fastest path here.
 
         Embeddings are returned position-aligned with the input ``chunks``
         so callers can ``zip(chunks, embeddings)`` directly.
@@ -910,6 +978,9 @@ class RAGPipeline:
         at the recall layer so RRF fusion and reranking only see in-range
         candidates.
         """
+        # Reset per-search warnings so each call reports only its own.
+        self.last_warnings = []
+        self.last_sub_queries = []
         # Caller-supplied sub-queries win; otherwise fall back to the
         # deterministic lexical expander. Either way ``query`` itself is
         # guaranteed present (it's the rerank reference) and the list is
@@ -918,6 +989,8 @@ class RAGPipeline:
             sub_queries = _normalize_sub_queries(sub_queries, query)
         else:
             sub_queries = self.expander.expand(query) or [query]
+        # Record the variants actually used so the caller can echo them.
+        self.last_sub_queries = list(sub_queries)
 
         conn = get_connection()
         try:
@@ -952,7 +1025,15 @@ class RAGPipeline:
             rr_scores = self.reranker.rerank(query, texts)
             used_rerank = any(s != 0.0 for s in rr_scores)
             if not used_rerank:
-                # Fallback to RRF ordering/scores.
+                # Fallback to RRF ordering/scores. Surface WHY the reranker
+                # was unavailable so the caller (LLM/user) doesn't silently
+                # get lower-precision results — a changed `strategy` field
+                # alone is easy to miss.
+                err = getattr(self.reranker, "_load_error", None) or \
+                    "reranker returned all-zero scores"
+                self.last_warnings.append(
+                    f"Reranker unavailable ({err}); results ranked by RRF "
+                    f"only — precision may be lower than usual.")
                 rr_scores = [rrf_scores[cid] for cid in ordered]
 
             scored = sorted(zip(ordered, rr_scores),

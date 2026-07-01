@@ -1,0 +1,56 @@
+[project]
+name = "jama-mcp-server"
+version = "0.1.0"
+requires-python = ">=3.10,<3.14"
+description = "Jama MCP Server — high-precision RAG + native REST query for Jama, CPU-only"
+
+# All dependencies are CPU-only. The cross-encoder reranker and the bge
+# embedding model both run on onnxruntime via fastembed — no torch/transformers,
+# no CUDA. This keeps the install small (~600MB) and avoids the Windows
+# c10.dll / WinError 1114 load failures that torch triggers.
+dependencies = [
+    # --- MCP framework (official Python SDK, exposes FastMCP) ---
+    "mcp>=1.2.0",
+    # --- HTTP / Jama REST client ---
+    "requests>=2.31.0",
+    "urllib3>=2.0.0",
+    # --- Storage engine ---
+    # sqlite-vec ships prebuilt wheels on PyPI / GitHub releases.
+    "sqlite-vec>=0.1.6",
+    # FTS5 is bundled with CPython's sqlite3 module (no extra package needed).
+    # --- LlamaIndex (SentenceSplitter + Document/TextNode for chunking) ---
+    "llama-index-core>=0.11.0",
+    # --- HTML cleaning for Jama rich-text fields ---
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+    # --- Local embedding + cross-encoder reranker (both ONNX via fastembed) ---
+    # fastembed serves BOTH the bge-small-en-v1.5 embedding AND the
+    # ms-marco-MiniLM-L-6-v2 cross-encoder reranker. TextCrossEncoder (the
+    # reranker API) is stable from 0.7+.
+    "fastembed>=0.7.0",
+    # onnxruntime: shared by the embedding and reranker models. Pin to a version
+    # whose Windows DLLs don't require the new VC++ Runtime. fastembed's constraint
+    # is Python-version-dependent:
+    #   py3.10-3.12 -> >=1.17.0, !=1.20.0   (1.20.1 is allowed and stable)
+    #   py3.13+     -> >1.21.0              (must use a newer build)
+    # 1.27.0 (what fastembed 0.8.0 pulls on py3.13) triggers a VC++ DLL failure
+    # on Windows, so for py3.13+ we pin 1.21.1 (the lowest satisfying >1.21).
+    'onnxruntime==1.20.1; python_version < "3.13"',
+    'onnxruntime==1.21.1; python_version >= "3.13"',
+    # --- Background incremental sync scheduler ---
+    "APScheduler>=3.10.0",
+    # APScheduler 3.x imports pkg_resources, removed in setuptools>=81.
+    "setuptools<81",
+    # --- Utilities ---
+    "python-dotenv>=1.0.0",
+]
+
+[tool.uv]
+# Aliyun mirror primary (China mainland acceleration); PyPI secondary (for
+# packages the Aliyun mirror may lack, e.g. sqlite-vec GitHub-only wheels).
+# Both are consulted; uv picks the best-matching wheel across indexes.
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+[[tool.uv.index]]
+url = "https://pypi.org/simple/"

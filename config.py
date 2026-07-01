@@ -11,34 +11,46 @@ from pathlib import Path
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
 except Exception:  # pragma: no cover - dotenv is optional at runtime
-    pass
+    load_dotenv = None
 
 # Project root = directory containing this config.py. All runtime artifacts
 # (SQLite DB, HF model cache) default to a project-local ``user/`` folder so
 # the server is self-contained and portable.
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Load .env from the project root (not the caller's cwd) so the server picks
+# up its configuration no matter what directory an MCP client launches it
+# from. ``load_dotenv()`` with no path searches the cwd, which is unreliable
+# for a stdio server spawned by Claude Desktop / Copilot CLI / etc.
+if load_dotenv is not None:
+    load_dotenv(PROJECT_ROOT / ".env")
 USER_DIR = PROJECT_ROOT / "user"
 USER_DIR.mkdir(parents=True, exist_ok=True)
 
-# Use the HuggingFace China mirror by default so model weights (e.g.
-# Qwen3-Reranker-0.6B) can be downloaded from inside mainland China. This is
-# read by huggingface_hub / transformers when fetching models. Override with
-# HF_ENDPOINT in the environment if a different mirror is preferred.
+# Use the HuggingFace China mirror by default so model weights (the ~80MB
+# cross-encoder reranker ONNX + ~130MB ONNX embedding model) can be downloaded
+# from inside mainland China. Both models download via fastembed, which uses
+# huggingface_hub and honours HF_ENDPOINT. Override with HF_ENDPOINT in the
+# environment if a different mirror is preferred.
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 # Default the HF cache to a project-local folder (user/huggingface) so the
-# 1.2GB reranker weights live inside the project, not in the user home dir.
-# Only set if the caller hasn't already configured HF_HOME/HUGGINGFACE_HUB_CACHE.
+# reranker + embedding weights live inside the project, not in the user home
+# dir. Only set if the caller hasn't already configured HF_HOME/HUGGINGFACE_HUB_CACHE.
 os.environ.setdefault("HF_HOME", str(USER_DIR / "huggingface"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(USER_DIR / "huggingface" / "hub"))
-# Disable HF's Xet transfer protocol. fastembed pulls the ONNX model via
+# Disable HF's Xet transfer protocol. fastembed pulls both ONNX models via
 # huggingface_hub, which defaults to the Xet protocol; on some networks it
 # fails mid-transfer. Forcing the plain HTTPS path avoids the failure.
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-# Once weights are cached we prefer offline mode so transient network errors
-# never block reranker loading in production.
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "0")
+# Silence the tqdm "Fetching N files" / per-file progress bars that
+# huggingface_hub (fastembed's ONNX downloads for both the embedding and the
+# reranker) emit. In a non-interactive shell — especially the MCP stdio
+# server, which runs headless — those bars spam thousands of carriage-return
+# lines on stderr and look like a hang. Set here (not just in bootstrap.py) so
+# server-driven syncs and selftest are silenced too; huggingface_hub reads
+# HF_HUB_DISABLE_PROGRESS_BARS lazily on each download.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 
 def _get(name: str, default: str = "") -> str:
@@ -57,6 +69,16 @@ def _get_float(name: str, default: float) -> float:
         return float(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _project_path(path: str) -> str:
+    """Resolve a path against PROJECT_ROOT when it is relative.
+
+    Keeps path-like settings (e.g. the SQLite DB) inside the project
+    regardless of the caller's cwd, so a stdio MCP server launched from an
+    arbitrary directory still finds its files. Absolute paths pass through.
+    """
+    return path if Path(path).is_absolute() else str(PROJECT_ROOT / path)
 
 
 @dataclass(frozen=True)
@@ -109,7 +131,7 @@ class EmbeddingSettings:
     # 60% leaves headroom for the MCP server + scheduler on a shared host.
     cpu_percent: int = _get_int("EMBEDDING_CPU_PERCENT", 60)
     # Minimum download throughput (bytes/s) for the model mirror speed test.
-    # bge-small-en-v1.5 is ~67MB; at 200KB/s that's ~5min — acceptable.
+    # The bge-small-en-v1.5 ONNX model is ~130MB; at 200KB/s that's ~11min — acceptable.
     download_min_bps: int = _get_int("EMBEDDING_DOWNLOAD_MIN_BPS", 200_000)
     # --- azure provider settings ---
     base_url: str = _get("EMBEDDING_BASE_URL", "https://your-embedding-endpoint.example.com")
@@ -143,38 +165,33 @@ class EmbeddingSettings:
 
 @dataclass(frozen=True)
 class RerankerSettings:
-    """Local Qwen3-Reranker-0.6B (CPU)."""
-    model_name: str = _get("RERANKER_MODEL", "Qwen/Qwen3-Reranker-0.6B")
-    # Max candidate pairs scored in one forward pass (memory bound). The Qwen3
-    # reranker is a full causal LM (vocab ~152k); each batch of N×max_length
-    # tokens produces an [N, max_length, vocab] logits tensor. At batch=16,
-    # max_length=512 that single tensor is ~5 GB (fp32) — the prior OOM cause.
-    # batch=4 keeps the peak well under 1 GB while staying fast enough.
-    batch_size: int = _get_int("RERANKER_BATCH_SIZE", 4)
-    # 256 is ample for (query + chunk) relevance; 512 doubled memory for no
-    # recall gain since chunks are already capped at chunk_size in indexing.
-    max_length: int = _get_int("RERANKER_MAX_LENGTH", 256)
+    """Local cross-encoder reranker (CPU, ONNX via fastembed).
+
+    Default model: ``cross-encoder/ms-marco-MiniLM-L-6-v2`` (~80MB). This is
+    the torch-style name; ``Reranker._resolve_model`` transparently remaps it
+    to its ONNX port (``Xenova/ms-marco-MiniLM-L-6-v2``) so the reranker loads
+    via fastembed/onnxruntime — the SAME runtime the bge embedding model uses —
+    with no torch/transformers dependency (eliminating the Windows
+    c10.dll/WinError 1114 load failure). A user's existing .env that names the
+    torch model keeps working unchanged.
+
+    RRF already fuses recall; the reranker only re-sorts the final 25
+    candidates, so the small MiniLM cross-encoder gives comparable precision to
+    the prior Qwen3-Reranker-0.6B at a fraction of the size. A cross-encoder
+    scores (query, document) pairs directly via a sequence-classification head
+    — no causal-LM prompt format, no large logits tensor.
+    """
+    model_name: str = _get("RERANKER_MODEL",
+                           "cross-encoder/ms-marco-MiniLM-L-6-v2")
     # If model loading fails, degrade to RRF-only scoring instead of crashing.
     allow_fallback: bool = _get("RERANKER_ALLOW_FALLBACK", "1") == "1"
-    device: str = _get("RERANKER_DEVICE", "cpu")
-    # Pre-flight speed test before pulling weights from the HF mirror.
-    hf_min_bytes_per_sec: int = _get_int("HF_MIN_BYTES_PER_SEC", 200_000)
-    hf_speed_test_timeout: int = _get_int("HF_SPEED_TEST_TIMEOUT", 20)
-    hf_download_retries: int = _get_int("HF_DOWNLOAD_RETRIES", 4)
-    device: str = _get("RERANKER_DEVICE", "cpu")
-    # Pre-flight speed test before pulling model weights from HuggingFace.
-    # If the HF mirror is slower than this (bytes/sec), abort with a network
-    # error instead of hanging for hours on a stalled download.
-    hf_min_bytes_per_sec: int = _get_int("RERANKER_HF_MIN_BYTES_PER_SEC", 200_000)
-    hf_speed_test_timeout: int = _get_int("RERANKER_HF_SPEED_TEST_TIMEOUT", 20)
-    hf_max_retries: int = _get_int("RERANKER_HF_MAX_RETRIES", 5)
 
 
 @dataclass(frozen=True)
 class StorageSettings:
     # SQLite DB lives in the project-local user/ folder by default so all
     # runtime data is self-contained. Override with JAMA_MCP_DB_PATH.
-    db_path: str = _get("JAMA_MCP_DB_PATH", str(USER_DIR / "jama_mcp.db"))
+    db_path: str = _project_path(_get("JAMA_MCP_DB_PATH", str(USER_DIR / "jama_mcp.db")))
     # Busy timeout (ms) for SQLite write concurrency (init sync vs. reads).
     busy_timeout_ms: int = _get_int("SQLITE_BUSY_TIMEOUT_MS", 5000)
 
@@ -198,10 +215,15 @@ class SyncSettings:
 
 @dataclass(frozen=True)
 class ChunkSettings:
-    """RecursiveCharacterTextSplitter tuning (data is 100% English, ~30% long)."""
+    """LlamaIndex SentenceSplitter tuning (data is 100% English, ~30% long).
+
+    ``make_splitter`` in rag_pipeline.py builds the actual SentenceSplitter from
+    ``chunk_size`` / ``chunk_overlap`` (plus a paragraph separator and a
+    secondary sentence regex hardcoded there, since SentenceSplitter takes those
+    as constructor kwargs rather than a generic ``separators`` list).
+    """
     chunk_size: int = _get_int("CHUNK_SIZE", 512)
     chunk_overlap: int = _get_int("CHUNK_OVERLAP", 80)
-    separators: tuple = field(default=("\\n\\n", "\\n", ". ", "? ", "! ", " ", ""))
 
 
 # NOTE: ``Settings`` is intentionally NOT frozen so that ``reload_settings()``
@@ -290,41 +312,128 @@ def validate_config() -> list[dict]:
                 "message": f"{name} is still a placeholder ({val}). Set the "
                            f"real value via the setup wizard or configure_jama.",
             })
+    # Orphan Azure config: EMBEDDING_BASE_URL / EMBEDDING_API_KEY are only
+    # used when EMBEDDING_PROVIDER=azure. If they're set under the default
+    # "local" provider they're silently ignored — a common misconfiguration
+    # that wastes a configured endpoint. Warn (not error) so the rest of the
+    # server still works; the user just needs to either set
+    # EMBEDDING_PROVIDER=azure or drop the unused vars.
+    if os.environ.get("EMBEDDING_PROVIDER", "local") != "azure":
+        orphans = [v for v in ("EMBEDDING_BASE_URL", "EMBEDDING_API_KEY",
+                               "EMBEDDING_MODEL", "EMBEDDING_DIMENSIONS")
+                   if os.environ.get(v, "").strip()
+                   and not os.environ.get(v, "").strip().startswith("your-")]
+        if orphans:
+            issues.append({
+                "field": "EMBEDDING_PROVIDER", "severity": "warn",
+                "feature": "embedding",
+                "message": f"Azure embedding vars ({', '.join(orphans)}) are "
+                           f"set but EMBEDDING_PROVIDER=local — they are "
+                           f"ignored. To use Azure, set EMBEDDING_PROVIDER="
+                           f"azure (this rebuilds the vector index); otherwise "
+                           f"remove the unused vars to avoid confusion.",
+            })
     return issues
 
 
-# All env keys the wizard knows how to write, in output order. Values come from
-# os.environ at write time; missing ones are emitted as blank lines so the file
-# stays a complete, self-documenting template.
+# All env keys the wizard/configure_jama can persist, in output order. This list
+# MUST stay in sync with every ``_get*``/``os.environ`` read above — a key read
+# by config but absent here is silently dropped by ``write_env_file`` (which only
+# emits keys in this list). The two most consequential omissions historically
+# were ``EMBEDDING_PROVIDER`` (a rewritten .env lost the azure->local switch and
+# silently reverted to the default) and ``RERANKER_MODEL`` (emitted as a blank
+# ``RERANKER_MODEL=`` line, which ``_get`` returns as ``""`` — overriding the
+# code default and crashing reranker load with "Repo id must use alphanumeric...").
+# Section headers are written as comments by ``write_env_file`` via ``_ENV_HEADERS``.
 _ENV_KEYS = [
+    # --- Jama REST API ---
     "JAMA_URL", "JAMA_CLIENT_ID", "JAMA_CLIENT_SECRET", "JAMA_API_PREFIX",
-    "JAMA_PAGE_SIZE", "JAMA_PAGE_DELAY",
+    "JAMA_PAGE_SIZE", "JAMA_PAGE_DELAY", "JAMA_REQUEST_TIMEOUT",
+    "JAMA_MAX_RETRIES", "JAMA_MIN_BYTES_PER_SEC", "JAMA_SPEED_TEST_TIMEOUT",
+    "JAMA_PAGE_MIN_BYTES_PER_SEC", "JAMA_PAGE_MAX_RETRIES",
+    # --- Embedding provider ---
+    "EMBEDDING_PROVIDER", "EMBEDDING_LOCAL_MODEL", "EMBEDDING_CPU_PERCENT",
+    "EMBEDDING_DOWNLOAD_MIN_BPS", "EMBEDDING_BATCH_SIZE",
+    "EMBEDDING_CONCURRENCY", "EMBEDDING_TIMEOUT",
+    # --- Azure embedding (only used when EMBEDDING_PROVIDER=azure) ---
     "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
     "EMBEDDING_DIMENSIONS", "EMBEDDING_KEY_HEADER",
-    "RERANKER_MODEL", "RERANKER_DEVICE", "RERANKER_ALLOW_FALLBACK",
+    # --- Local cross-encoder reranker (CPU, ONNX via fastembed) ---
+    "RERANKER_MODEL", "RERANKER_ALLOW_FALLBACK",
+    # --- Storage ---
     "JAMA_MCP_DB_PATH", "SQLITE_BUSY_TIMEOUT_MS",
-    "SYNC_ENABLED", "SYNC_INTERVAL_HOURS",
+    # --- Incremental sync ---
+    "SYNC_ENABLED", "SYNC_INTERVAL_HOURS", "SYNC_MAX_ITEMS_PER_RUN",
+    "SYNC_DOWNLOAD_CONCURRENCY",
+    # --- Chunking ---
     "CHUNK_SIZE", "CHUNK_OVERLAP",
+    # --- MCP transport ---
+    "JAMA_MCP_TRANSPORT", "JAMA_MCP_HOST", "JAMA_MCP_PORT",
 ]
+
+# Comment headers inserted before each logical group in the written .env, so the
+# file stays self-documenting. Keys not preceded by a header get no comment line.
+_ENV_HEADERS: dict[str, str] = {
+    "JAMA_URL": "Jama REST API",
+    "EMBEDDING_PROVIDER": "Embedding provider",
+    "EMBEDDING_BASE_URL": "Azure embedding (only used when EMBEDDING_PROVIDER=azure)",
+    "RERANKER_MODEL": "Local cross-encoder reranker (CPU, ONNX via fastembed)",
+    "JAMA_MCP_DB_PATH": "Storage",
+    "SYNC_ENABLED": "Incremental sync",
+    "CHUNK_SIZE": "Chunking",
+    "JAMA_MCP_TRANSPORT": "MCP transport",
+}
 
 
 def write_env_file(values: dict, path: str | None = None) -> str:
     """Write a ``.env`` file from a ``{var: value}`` mapping.
 
-    Only the supplied keys are overridden; everything else is taken from the
-    current environment so a partial wizard run never clobbers existing
-    config. Returns the absolute path written.
+    Only the supplied keys are overridden; for every other key the *current
+    environment* is consulted and the value is written through **only if it is
+    set and non-empty**. A key that is unset in the environment (and not in
+    ``values``, or given as ``None``/``""``) is OMITTED from the file rather than
+    emitted as ``KEY=`` — a present-but-empty env var makes ``_get`` return ``""``,
+    overriding the code default, so emitting blanks would silently break defaults
+    like ``RERANKER_MODEL`` (empty -> reranker load fails) and
+    ``EMBEDDING_LOCAL_MODEL``. Returns the absolute path written.
     """
     target = Path(path) if path else PROJECT_ROOT / ".env"
-    merged = {k: os.environ.get(k, "") for k in _ENV_KEYS}
-    merged.update({k: ("" if v is None else str(v)) for k, v in values.items()})
+    # Effective value per key: caller override wins; otherwise the live env var
+    # (only if set + non-empty, so we don't write blank lines that clobber code
+    # defaults). An explicitly-empty override ("" / None) is treated as "unset"
+    # rather than written as ``KEY=`` — none of these vars have a meaningful
+    # empty value, and an empty ``RERANKER_MODEL=`` would break reranker load.
+    eff: dict[str, str] = {}
+    for k in _ENV_KEYS:
+        v = values.get(k)
+        if k in values and v not in (None, ""):
+            eff[k] = str(v)
+        elif k in os.environ and os.environ[k] != "":
+            eff[k] = os.environ[k]
+        # else: leave unset -> omitted from the file -> code default applies
+    # Caller may also set a key NOT in _ENV_KEYS (escape hatch); write those too
+    # so configure_jama never silently drops a value the user explicitly passed.
+    for k, v in values.items():
+        if k not in eff and v not in (None, ""):
+            eff[k] = str(v)
     lines = [
         "# Jama MCP Server environment (managed by setup_wizard / configure_jama).",
         "# Copy to .env and fill in. All values are read by config.py.",
+        "# Keys left out of this file fall back to the code defaults in config.py.",
         "",
     ]
     for k in _ENV_KEYS:
-        lines.append(f"{k}={merged.get(k, '')}")
+        if k in _ENV_HEADERS:
+            lines.append(f"# --- {_ENV_HEADERS[k]} ---")
+        if k in eff:
+            lines.append(f"{k}={eff[k]}")
+        # Unset + no default-override -> omitted (code default applies)
+    # Any extra caller-supplied keys not in _ENV_KEYS, appended at the end.
+    extra = [k for k in values if k not in _ENV_KEYS and values[k] is not None]
+    if extra:
+        lines.append("# --- Additional keys ---")
+        for k in extra:
+            lines.append(f"{k}={values[k]}")
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(target)
 
@@ -339,7 +448,7 @@ def reload_settings() -> None:
     call time, not import time).
     """
     try:
-        load_dotenv(override=True)
+        load_dotenv(PROJECT_ROOT / ".env", override=True)
     except Exception:  # pragma: no cover
         pass
     settings.jama = JamaSettings()

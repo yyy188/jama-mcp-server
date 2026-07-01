@@ -1,14 +1,23 @@
 # =====================================================================
 # Jama MCP Server - Python dependencies
 # ---------------------------------------------------------------------
-# Default index: Aliyun mirror (China mainland acceleration).
-# GitHub-only deps (e.g. sqlite-vec wheels from GitHub releases) are
-# pulled via the secondary index. Pip falls back to it automatically.
-# Install with:  pip install -r requirements.txt
+# RECOMMENDED: use `uv` for deterministic installs (see pyproject.toml +
+# uv.lock). `uv sync` reproduces the exact dependency tree the project was
+# developed against, with no version-resolution surprises across machines.
+#
+# This requirements.txt is kept for `pip install -r requirements.txt`
+# (fallback / CI). The canonical dependency list lives in pyproject.toml;
+# if you edit a dependency, update pyproject.toml and run `uv lock` to
+# regenerate uv.lock, then mirror the change here.
+#
+# All dependencies are CPU-only — no torch/transformers, no CUDA. The
+# cross-encoder reranker and the bge embedding model both run on
+# onnxruntime via fastembed.
 # =====================================================================
 
 --index-url https://mirrors.aliyun.com/pypi/simple/
 --extra-index-url https://pypi.org/simple/
+
 
 # --- MCP framework (official Python SDK, exposes FastMCP) ---
 mcp>=1.2.0
@@ -18,30 +27,27 @@ requests>=2.31.0
 urllib3>=2.0.0
 
 # --- Storage engine ---
-# sqlite-vec ships prebuilt wheels on PyPI / GitHub releases.
 sqlite-vec>=0.1.6
-# FTS5 is bundled with CPython's sqlite3 module (no extra package needed).
 
-# --- LlamaIndex (primary RAG framework: SentenceSplitter + Document/TextNode
-#     for chunking; Multi-Query expansion is done by the MCP LLM client) ---
+# --- LlamaIndex (SentenceSplitter + Document/TextNode for chunking) ---
 llama-index-core>=0.11.0
 
 # --- HTML cleaning for Jama rich-text fields ---
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 
-# --- Local embedding (bge-small-en-v1.5 on CPU via ONNX) ---
-fastembed>=0.3.0
+# --- Local embedding + cross-encoder reranker (both ONNX via fastembed) ---
+fastembed>=0.7.0
 
-# --- Local Qwen3-Reranker-0.6B (CPU) ---
-transformers>=4.44.0
-torch>=2.2.0
+# onnxruntime: shared by the embedding and reranker models. Pinned to a version
+# whose Windows DLLs don't require the new VC++ Runtime (1.27.0 triggers
+# WinError 1114 on Windows). py3.10-3.12 -> 1.20.1; py3.13+ -> 1.21.1.
+onnxruntime==1.20.1; python_version < "3.13"
+onnxruntime==1.21.1; python_version >= "3.13"
 
 # --- Background incremental sync scheduler ---
 APScheduler>=3.10.0
-# APScheduler 3.x imports pkg_resources, which was removed in setuptools>=81.
 setuptools<81
 
 # --- Utilities ---
 python-dotenv>=1.0.0
-tenacity>=8.2.0

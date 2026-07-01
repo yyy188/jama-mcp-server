@@ -1,6 +1,16 @@
 """Jama MCP Server entry point.
 
-Exposes MCP tools to LLM clients (Model Context Protocol, stdio transport):
+Exposes MCP tools to LLM clients over three transports (selectable via the
+JAMA_MCP_TRANSPORT env var):
+  * stdio (default)     — local MCP client spawns this as a subprocess.
+  * streamable-http     — server listens on a port; remote clients connect via
+                          http://host:8000/mcp (the MCP new standard).
+  * sse                 — server-sent events transport for older MCP clients
+                          (http://host:8000/sse).
+For HTTP/SSE modes set JAMA_MCP_HOST (0.0.0.0 for remote access) and
+JAMA_MCP_PORT (default 8000).
+
+Tools exposed:
   * bootstrap_models        - async pre-download of embedding + reranker models
   * init_jama_project        - async background init (returns job_id)
   * reinit_jama_project      - async full re-sync of an initialized project
@@ -16,8 +26,10 @@ run as async background jobs in a thread pool and report progress into the
 syncs initialized projects every N hours: it walks items whose modifiedDate >
 last_sync_time, cleans them, re-chunks and updates the FTS5 + sqlite-vec indexes.
 
-Run with:  python server.py
-Configure an MCP client (Claude Desktop, etc.) to launch this as a stdio server.
+Run with:  python server.py            (stdio, default)
+           JAMA_MCP_TRANSPORT=streamable-http python server.py   (HTTP)
+Configure an MCP client (Claude Desktop, etc.) to launch this as a stdio server,
+or connect remotely in HTTP/SSE mode.
 """
 from __future__ import annotations
 
@@ -33,7 +45,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from mcp.server.fastmcp import FastMCP
 
 from config import reload_settings, settings, write_env_file
-from db_setup import (count_chunks, create_job, get_active_job_for_project,
+from db_setup import (count_chunks, count_items, create_job,
+                      get_active_job_for_project,
                       get_connection, get_job, get_latest_job_for_project,
                       get_project, init_db, list_initialized_projects,
                       reconcile_stale_jobs, update_job, upsert_item,
@@ -93,7 +106,7 @@ Jama MCP — tool selection guide (read before choosing a tool)
 DEFAULT TO FUSION SEARCH. For any question that is not a precise lookup,
 call `search_jama_semantics`. It already fuses three retrieval signals in
 one call — keyword (FTS5/BM25), vector (sqlite-vec cosine) and RRF — then
-reranks with a local Qwen3 model. So "like", "keyword" and "semantic"
+reranks with a local cross-encoder model. So "like", "keyword" and "semantic"
 queries are ALL best answered by this single tool. Use it for:
   • natural-language questions      ("how does volume sync work")
   • partial / fuzzy matches         ("something about login timeout")
@@ -125,18 +138,21 @@ the `sub_queries` parameter; keep the original query in `query` (it is
 the rerank reference). This maximizes recall for RRF fusion and is
 preferred over letting the server fall back to lexical variants.
 
-MODEL BOOTSTRAP (first-run, before any init). The embedding model (~67MB)
-and Qwen3 reranker weights (~1.2GB) are NOT bundled — they download on first
-use. Call `bootstrap_models()` right after the server is configured: it
-downloads BOTH models asynchronously and returns a job_id immediately, so the
-first sync isn't slowed by a download and a download failure surfaces here
-instead of mid-sync. Poll `get_bootstrap_progress(job_id)` roughly every 2
-minutes, reporting each sample (status, progress %, message with live download
-bytes for the reranker, e.g. "Downloading reranker weights: 680/1200 MB") to the
-user, until status is DONE or ERROR. Already-cached models are skipped, so
+MODEL BOOTSTRAP (first-run, before any init). The embedding model (~130MB
+ONNX) and cross-encoder reranker (~80MB ONNX) are NOT bundled — they download
+on first use. Both run on onnxruntime via fastembed (no torch dependency).
+Call `bootstrap_models()` right after the server is configured: it downloads
+BOTH models asynchronously and returns a job_id immediately, so the first
+sync isn't slowed by a download and a download failure surfaces here instead
+of mid-sync. Poll `get_bootstrap_progress(job_id)` roughly every 2 minutes,
+reporting each sample (status, progress %, message) to the user, until status
+is DONE or ERROR. Progress is phase-based (not live bytes): fastembed (used
+for both models) lacks per-chunk byte callbacks, so `message` reports phase
+transitions (e.g. "Downloading reranker model (...)" -> "Reranker model
+ready") rather than byte counts. Already-cached models are skipped, so
 re-running bootstrap after success is a fast no-op. OPTIONAL: if skipped,
-init/sync still works (downloads on demand) but the first sync is slower and a
-download failure surfaces mid-sync — prefer running bootstrap first.
+init/sync still works (downloads on demand) but the first sync is slower and
+a download failure surfaces mid-sync — prefer running bootstrap first.
 
 SYNC MONITORING. `init_jama_project` (first init) and `reinit_jama_project`
 (re-index an already-initialized project) run in the BACKGROUND and return a
@@ -249,11 +265,12 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
     upsert_project(conn, project_id, status="INITIALIZING")
 
     # ---- Step 1: pre-download ML models BEFORE any indexing work. ----
-    # Both the embedding model (64 MB) and the reranker (1.2 GB) are fetched
-    # first so that (a) a download failure surfaces immediately with a clear
-    # message instead of mid-sync, and (b) the first search after sync doesn't
-    # stall on a 1.2 GB download. Non-fatal: failures just defer to lazy load
-    # (embedding) or RRF fallback (reranker) — sync still proceeds.
+    # Both the embedding model (~130MB ONNX) and the reranker (~80MB MiniLM)
+    # are fetched first so that (a) a download failure surfaces immediately
+    # with a clear message instead of mid-sync, and (b) the first search
+    # after sync doesn't stall on a model download. Non-fatal: failures just
+    # defer to lazy load (embedding) or RRF fallback (reranker) — sync still
+    # proceeds.
     if job_id:
         update_job(conn, job_id, status="RUNNING", progress=0.0,
                    message="Downloading embedding + reranker models")
@@ -329,8 +346,6 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
     # overwritten — no duplicates, no lost data). Items sitting in the queue at
     # crash time were never written, so they're simply re-fetched on resume.
     import queue
-    import threading
-    pipeline = rag()
     max_items = settings.sync.max_items_per_run if incremental else None
     dl_concurrency = settings.sync.download_concurrency
     batch_size = settings.embedding.batch_size
@@ -461,14 +476,22 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
         if job_id:
             update_job(conn, job_id, status="DONE", progress=1.0,
                        done=0, message="No new/modified items")
+        # Report the true persisted totals (an incremental run that found 0
+        # changes must NOT clobber item_count with the per-run ``done``=0).
         upsert_project(conn, project_id, name=proj_name, status="READY",
-                       last_sync_time=utcnow_iso())
+                       last_sync_time=utcnow_iso(),
+                       item_count=count_items(conn, project_id),
+                       chunk_count=count_chunks(conn, project_id))
         return
 
     final_chunk_count = count_chunks(conn, project_id)
+    # ``done`` is the count processed THIS run. For an incremental sync that's
+    # only the modified items, not the project total — read the true total from
+    # the items table so get_sync_status stays accurate after both run kinds.
     upsert_project(conn, project_id, name=proj_name, status="READY",
                    last_sync_time=utcnow_iso(),
-                   item_count=done, chunk_count=final_chunk_count)
+                   item_count=count_items(conn, project_id),
+                   chunk_count=final_chunk_count)
     if job_id:
         update_job(conn, job_id, status="DONE", progress=1.0, done=done,
                    message=f"Done: {done} items, {chunk_total} chunks "
@@ -508,12 +531,12 @@ def _run_bootstrap_job(job_id: str) -> None:
 
     Reports live progress into the ``sync_jobs`` row (kind="bootstrap") so
     ``get_bootstrap_progress`` can be polled every ~2 min. The reranker
-    download (1.2 GB, our own ``download_with_retry``) feeds a real
-    received/expected byte callback; the embedding download (67 MB, fastembed
-    black box) only reports phase transitions (downloading -> ready) since
-    fastembed exposes no byte callback. Either model already cached skips its
-    download. Failures are non-fatal per-model (marked in the message) but the
-    job still ends ERROR if any model is missing at the end.
+    (~80MB cross-encoder, ONNX via fastembed) and the embedding model
+    (~130MB ONNX) both download through fastembed, which gives no per-chunk
+    byte callback — so progress is reported as phase transitions
+    (downloading -> ready), not live bytes. Either model already cached skips
+    its download. Failures are non-fatal per-model (marked in the message) but
+    the job still ends ERROR if any model is missing at the end.
     """
     conn = db()
 
@@ -529,7 +552,8 @@ def _run_bootstrap_job(job_id: str) -> None:
 
     # --- Phase 1: embedding model (local only; azure needs no download) ------
     if provider == "local":
-        _set(0.1, "Checking/downloading embedding model (bge-small-en-v1.5, ~67MB)")
+        _set(0.1, f"Checking/downloading embedding model "
+                  f"({settings.embedding.local_model}, ~130MB)")
         emb = pipeline.embedder
         try:
             if emb._model_present():  # type: ignore[attr-defined]
@@ -544,20 +568,16 @@ def _run_bootstrap_job(job_id: str) -> None:
     else:
         _set(0.45, f"Embedding provider is {provider} (no model to download)")
 
-    # --- Phase 2: reranker weights (download_with_retry, real byte progress) -
-    _set(0.5, "Checking/downloading reranker weights (Qwen3-Reranker-0.6B, ~1.2GB)")
+    # --- Phase 2: reranker model (ONNX via fastembed, no byte-level progress) --
+    # fastembed (used by ensure_downloaded) gives no per-chunk callback, so we
+    # can't show live bytes — only phase transitions. The progress band
+    # 0.5..0.95 is held at 0.5 while downloading, then jumps to 0.95 on success.
+    _set(0.5, f"Downloading reranker model ({settings.reranker.model_name}, ~80MB ONNX)")
 
     def _reranker_cb(received: int, expected: int | None) -> None:
-        # Map reranker bytes onto the 0.5..0.95 progress band. Update the job
-        # message with the byte figure so the ~2-min poll shows concrete progress.
-        if expected:
-            frac = min(received / expected, 1.0)
-        else:
-            frac = 0.0
-        pct = 50 + int(frac * 45)  # 50% .. 95%
-        mb = f"{received / 1048576:.0f}/{expected / 1048576:.0f} MB" if expected \
-            else f"{received / 1048576:.0f} MB"
-        _set(pct / 100.0, f"Downloading reranker weights: {mb}")
+        # Called once at completion by _ensure_weights_downloaded (snapshot_download
+        # has no byte callback). Advance to 0.95 so the monitor sees movement.
+        _set(0.95, "Reranker model downloaded")
 
     try:
         rr = pipeline.reranker
@@ -565,9 +585,9 @@ def _run_bootstrap_job(job_id: str) -> None:
             _set(0.95, "Reranker already available/failed-skip")
         else:
             rr.ensure_downloaded(progress_callback=_reranker_cb)
-            _set(0.95, "Reranker weights ready")
+            _set(0.95, "Reranker model ready")
     except Exception as exc:
-        msg = f"Reranker weights download failed: {exc}"
+        msg = f"Reranker model download failed: {exc}"
         log.error("Bootstrap %s: %s", job_id, msg)
         errors.append(msg)
 
@@ -698,13 +718,15 @@ _bootstrap_job_id: str | None = None
 def bootstrap_models() -> dict:
     """Pre-download the embedding + reranker models so syncs never wait on them.
 
-    Downloads the local embedding model (bge-small-en-v1.5, ~67MB) and the
-    Qwen3-Reranker weights (~1.2GB) into the project-local cache, ASYNCHRONOUSLY.
-    Returns a job_id immediately. This is the recommended first step after
-    installing/configuring the server — call it BEFORE init_jama_project so the
-    first sync isn't slowed by model downloads. Models already cached are
-    skipped. Poll progress with get_bootstrap_progress roughly every 2 minutes,
-    reporting each sample to the user, until status is DONE or ERROR.
+    Downloads the local embedding model (bge-small-en-v1.5, ~130MB ONNX) and the
+    cross-encoder reranker (ms-marco-MiniLM-L-6-v2, ~80MB ONNX) into the
+    project-local cache, ASYNCHRONOUSLY. Both run on onnxruntime via fastembed
+    — no torch/transformers dependency. Returns a job_id immediately. This is
+    the recommended first step after installing/configuring the server — call
+    it BEFORE init_jama_project so the first sync isn't slowed by model
+    downloads. Models already cached are skipped. Poll progress with
+    get_bootstrap_progress roughly every 2 minutes, reporting each sample to
+    the user, until status is DONE or ERROR.
 
     Returns:
         {"job_id": "...", "status": "RUNNING"} or, if a bootstrap is already
@@ -749,10 +771,12 @@ def get_bootstrap_progress(job_id: str) -> dict:
     """Poll the progress of a bootstrap_models job.
 
     After calling bootstrap_models, poll this roughly every 2 minutes, reporting
-    each sample (status, progress %, message with live download bytes) to the
-    user, until status is DONE or ERROR. The message field carries concrete
-    download progress (e.g. "Downloading reranker weights: 680/1200 MB") while
-    the job is running.
+    each sample (status, progress %, message) to the user, until status is DONE
+    or ERROR. Progress is phase-based, not live bytes: both the embedding
+    (~130MB ONNX, via fastembed) and the reranker (~80MB ONNX, via fastembed)
+    lack per-chunk byte callbacks, so `message` reports phase transitions (e.g.
+    "Downloading reranker model (...)" -> "Reranker model ready") rather than
+    byte counts.
 
     Returns:
         {"job_id","project_id","kind","status","progress","total","done",
@@ -901,12 +925,12 @@ def search_jama_semantics(project_id: str, query: str,
 
     This is the DEFAULT tool for any non-precise question. It fuses keyword
     (FTS5/BM25), vector (sqlite-vec cosine) and RRF in one call, then reranks
-    with a local Qwen3 model — so "like", "keyword" and "semantic" queries are
-    all best answered here. Prefer it over native metadata unless the user
-    gives an exact document key / status / item id.
+    with a local cross-encoder model (ONNX via fastembed/onnxruntime) — so "like",
+    "keyword" and "semantic" queries are all best answered here. Prefer it over
+    native metadata unless the user gives an exact document key / status / item id.
 
     Pipeline: client Multi-Query expansion -> hybrid recall (sqlite-vec +
-    FTS5) -> RRF fusion -> local Qwen3-Reranker-0.6B -> top_k results.
+    FTS5) -> RRF fusion -> local cross-encoder reranker -> top_k results.
 
     Args:
         project_id: numeric string Jama project id (must be initialized first).
@@ -1011,34 +1035,41 @@ def search_jama_semantics(project_id: str, query: str,
         return {"error": f"Invalid timestamp: {exc}"}
 
     try:
-        results = rag().search(pid, query.strip(),
-                               sub_queries=sub_queries,
-                               item_type=it,
-                               top_k=top_k, candidate_k=candidate_k,
-                               modified_after=modified_after,
-                               modified_before=modified_before)
+        pipeline = rag()
+        results = pipeline.search(pid, query.strip(),
+                                  sub_queries=sub_queries,
+                                  item_type=it,
+                                  top_k=top_k, candidate_k=candidate_k,
+                                  modified_after=modified_after,
+                                  modified_before=modified_before)
+        warnings = list(pipeline.last_warnings)
     except Exception as exc:
         log.error("search failed: %s\n%s", exc, traceback.format_exc())
         return {"error": f"Search failed: {exc}"}
     # Echo the query variants actually used by the pipeline so the caller can
-    # verify expansion happened. Computed defensively so a reflection failure
-    # never discards already-computed search results.
-    try:
-        from rag_pipeline import _normalize_sub_queries
-        used = _normalize_sub_queries(sub_queries or [], query.strip())
-    except Exception:
+    # verify expansion happened. Read from the pipeline (which records both
+    # caller-supplied and lexical-fallback variants) so the lexical-fallback
+    # path reports the real variants used, not just [query]. Computed
+    # defensively so a reflection failure never discards search results.
+    used = list(getattr(pipeline, "last_sub_queries", []) or [])
+    if not used:
         used = [query.strip()] if query.strip() else []
-    return {"project_id": pid, "query": query,
+    resp = {"project_id": pid, "query": query,
             "sub_queries_used": used,
             "count": len(results),
             "modified_after": modified_after,
             "modified_before": modified_before,
             "results": results}
+    if warnings:
+        # Surface silent degradations (e.g. reranker load failure -> RRF
+        # fallback) so the LLM can tell the user precision may be lower.
+        resp["warnings"] = warnings
+    return resp
 
 
 @mcp.tool()
 def query_jama_native_metadata(project_id: str, document_key: str = None,
-                               item_type: int = None, status: str = None,
+                               item_type: str = None, status: str = None,
                                keyword: str = None) -> dict:
     """Query Jama's native REST API directly for exact metadata filtering.
 
@@ -1053,7 +1084,10 @@ def query_jama_native_metadata(project_id: str, document_key: str = None,
     Args:
         project_id: numeric string Jama project id.
         document_key: exact Jama document key (e.g. "SA-TC-7").
-        item_type: Jama item-type id (e.g. 89011 = Test Case).
+        item_type: Jama item-type id as a numeric string (e.g. "89011" for Test
+                   Case). Pass None for all types. Kept as a string (not int)
+                   to match `search_jama_semantics` and the other MCP tools,
+                   which all take ids as numeric strings.
         status: exact status string (e.g. "BLOCKED", "APPROVED").
         keyword: full-text 'contains' filter delegated to Jama.
 
@@ -1068,9 +1102,19 @@ def query_jama_native_metadata(project_id: str, document_key: str = None,
         pid = int(project_id)
     except (TypeError, ValueError):
         return {"error": "project_id must be a numeric string"}
+    # Normalize item_type to int (or None), matching search_jama_semantics.
+    # The schema declares it as a string so the tool surface stays consistent
+    # across all id-bearing parameters (project_id / item_type / item_id are
+    # all numeric strings); convert here before handing to the REST client.
+    it = None
+    if item_type is not None and str(item_type).strip():
+        try:
+            it = int(item_type)
+        except (TypeError, ValueError):
+            return {"error": "item_type must be a numeric string or null"}
     try:
         rows = jama().query_items_native(
-            pid, document_key=document_key, item_type=item_type,
+            pid, document_key=document_key, item_type=it,
             status=status, keyword=keyword, limit=20)
     except Exception as exc:
         log.error("native query failed: %s\n%s", exc, traceback.format_exc())
@@ -1514,18 +1558,41 @@ def validate_setup(live: bool = False) -> dict:
 
 
 def _live_probe() -> dict:
-    """Live (network) checks for Jama auth + embedding endpoint."""
+    """Live (network) checks for Jama auth + the active embedding backend."""
     result: dict = {"jama": None, "embedding": None}
+    # Jama: OAuth + connectivity. The pre-flight speed test probes a single
+    # /projects page (~20KB) — too small for a stable bandwidth measurement
+    # (server-side processing latency dominates the body-transfer clock), so on
+    # a healthy link it routinely dips below the 20KB/s floor that's meant for
+    # the multi-MB model download. Treat a "too slow" verdict here as a
+    # non-fatal warning instead of a failure: ``list_projects()`` is the real
+    # proof that OAuth + connectivity work. The bandwidth gate still applies in
+    # the sync path, where a real download is about to start.
+    from net_guard import NetworkTooSlowError
+    client = jama()
+    speed_warning: str | None = None
     try:
-        client = jama()
         client.preflight_speed_check()
-        projects = list(client.list_projects())
-        result["jama"] = {"ok": True, "project_count": len(projects)}
+    except NetworkTooSlowError as exc:
+        speed_warning = str(exc)[:200]
     except Exception as exc:
         result["jama"] = {"ok": False, "error": str(exc)[:300]}
+    if result["jama"] is None:
+        try:
+            projects = list(client.list_projects())
+            info: dict = {"ok": True, "project_count": len(projects)}
+            if speed_warning:
+                info["speed_warning"] = speed_warning
+            result["jama"] = info
+        except Exception as exc:
+            result["jama"] = {"ok": False, "error": str(exc)[:300]}
+    # Embedding: probe the ACTIVE provider's embedder (local CPU bge or azure),
+    # not a hard-coded Azure client. The old code always instantiated
+    # ``EmbeddingClient()`` against the placeholder Azure URL, so under the
+    # default ``local`` provider ``validate_setup(live=True)`` always reported
+    # embedding failure even though local embedding worked fine.
     try:
-        from rag_pipeline import EmbeddingClient
-        vec = EmbeddingClient().embed_one("jama mcp validate")
+        vec = rag().embedder.embed_one("jama mcp validate")
         result["embedding"] = {"ok": True, "dimensions": len(vec)}
     except Exception as exc:
         result["embedding"] = {"ok": False, "error": str(exc)[:300]}
@@ -1676,7 +1743,7 @@ def _warn_if_models_missing() -> None:
                 missing.append("embedding (bge-small-en-v1.5)")
         # Reranker: lightweight on-disk check (no load, no network).
         if not pipeline.reranker.weights_cached():
-            missing.append("reranker (Qwen3-Reranker-0.6B)")
+            missing.append(f"reranker ({settings.reranker.model_name})")
     except Exception:
         return  # don't let a probe failure noise up startup
     if missing:
@@ -1688,7 +1755,9 @@ def _warn_if_models_missing() -> None:
 
 def main() -> None:
     # Eagerly initialize the DB so schema/extension errors surface at startup.
-    init_db()
+    # Reuse the shared singleton connection — calling init_db() standalone here
+    # would open (and leak) a SECOND connection alongside db()'s lazy one.
+    db()
     # Clear crash-leftover RUNNING jobs before any worker runs, so the monitor
     # never reports a phantom in-flight job. Must precede _resume_interrupted_syncs
     # so resumed INITIALIZING projects get a fresh job row rather than reusing a
@@ -1701,8 +1770,25 @@ def main() -> None:
     _resume_interrupted_syncs()
     _start_scheduler()
     _warn_if_models_missing()
-    log.info("Jama MCP Server starting (stdio)...")
-    mcp.run(transport="stdio")
+    # Transport selection. stdio (default) is for local MCP clients that spawn
+    # the server as a subprocess. streamable-http / sse expose the server over
+    # HTTP so remote clients (or a Docker container) can connect by URL.
+    # FASTMCP_HOST/FASTMCP_PORT env vars do NOT work (FastMCP's constructor
+    # kwargs override them), so we set mcp.settings.host/port directly before
+    # run() — the Settings pydantic model is mutable.
+    transport = os.environ.get("JAMA_MCP_TRANSPORT", "stdio")
+    if transport in ("sse", "streamable-http"):
+        mcp.settings.host = os.environ.get("JAMA_MCP_HOST", "127.0.0.1")
+        try:
+            mcp.settings.port = int(os.environ.get("JAMA_MCP_PORT", "8000"))
+        except ValueError:
+            mcp.settings.port = 8000
+    elif transport not in ("stdio",):
+        log.warning("Unknown JAMA_MCP_TRANSPORT=%r; falling back to stdio",
+                    transport)
+        transport = "stdio"
+    log.info("Jama MCP Server starting (%s)...", transport)
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

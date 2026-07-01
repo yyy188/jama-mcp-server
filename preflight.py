@@ -34,14 +34,15 @@ _CORE_DEPS = [
 _OPTIONAL_DEPS = [
     ("mcp", "MCP framework (FastMCP)"),
     ("llama_index.core", "LlamaIndex chunking"),
-    ("transformers", "local Qwen3 reranker"),
-    ("torch", "local Qwen3 reranker"),
 ]
 
-# Provider-specific embedding deps. Only required for the active provider.
+# Provider-specific embedding deps. fastembed serves BOTH the local bge
+# embedding AND the cross-encoder reranker (both run on onnxruntime), so it is
+# core for the local provider. azure only needs requests (already in _CORE_DEPS).
 _PROVIDER_DEPS = {
-    "local": [("fastembed", "local CPU embedding (bge-small-en-v1.5)")],
-    "azure": [],  # azure uses requests, already in _CORE_DEPS
+    "local": [("fastembed", "local CPU embedding (bge-small-en-v1.5) + "
+                            "cross-encoder reranker (MiniLM, ONNX)")],
+    "azure": [],
 }
 
 
@@ -74,7 +75,8 @@ def check_dependencies() -> dict[str, Any]:
         if not ok:
             missing_optional.append({"package": name, "purpose": purpose, "error": err})
     # The active embedding provider has its own required deps. fastembed is
-    # CORE for local (no embedding works without it); azure only needs requests.
+    # CORE for local (no embedding OR reranker works without it); azure only
+    # needs requests.
     provider = settings.embedding.provider
     for name, purpose in _PROVIDER_DEPS.get(provider, []):
         ok, err = _try_import(name)
