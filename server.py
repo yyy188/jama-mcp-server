@@ -1038,7 +1038,7 @@ def get_sync_status(project_id: str) -> dict:
 def search_jama_semantics(project_id: str, query: str,
                           sub_queries: list[str] = None,
                           item_type: str = None, top_k: int = 5,
-                          candidate_k: int = 50,
+                          candidate_k: int = 100,
                           modified_after: str = None,
                           modified_before: str = None) -> dict:
     """Semantic search over an initialized Jama project using high-precision RAG.
@@ -1071,10 +1071,10 @@ def search_jama_semantics(project_id: str, query: str,
         item_type: optional Jama item-type id to filter (e.g. "89011" for Test
                    Cases, "89009" for Requirements). Pass None for all.
         top_k: final results to return (default 5).
-        candidate_k: candidate pool size before reranking (default 50). A
-                     larger pool improves recall (the vector + FTS recall
-                     path is capped by this) at minimal latency cost — the
-                     MiniLM reranker scores 50 candidates in ~50ms on CPU.
+        candidate_k: candidate pool size before reranking (default 100). A
+                     larger pool improves recall (vector+FTS recall is capped
+                     by this): measured vecR@25=7%, @50=13%, @100=21%, @200=34%.
+                     The MiniLM reranker scores 100 candidates in ~1.5s on CPU.
                      Range 1-500; must be >= top_k.
         modified_after: optional ISO-8601 lower bound on item modified date
                         (inclusive). Naive timestamps are assumed UTC.
