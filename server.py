@@ -48,7 +48,8 @@ from config import reload_settings, settings, write_env_file
 from db_setup import (count_chunks, count_items, create_job,
                       get_active_job_for_project,
                       get_connection, get_job, get_latest_job_for_project,
-                      get_project, init_db, list_initialized_projects,
+                      get_project, indexed_item_ids, init_db,
+                      list_initialized_projects,
                       reconcile_stale_jobs, update_job, upsert_item,
                       upsert_project, replace_chunks, write_txn)
 from jama_client import JamaClient, utcnow_iso
@@ -243,25 +244,57 @@ def _ensure_ready(require: set[str]) -> dict | None:
 # Core sync logic (shared by init tool + scheduler)
 # --------------------------------------------------------------------------- #
 def _sync_project(project_id: int, *, job_id: str | None,
-                  incremental: bool) -> None:
+                  incremental: bool | str) -> None:
     """Download, clean, chunk, embed and index a project's items.
 
     Serializes per-project: a user init and a scheduler incremental sync for
     the SAME project can't run at once (they'd race on upserts). Different
     projects still sync in parallel.
+
+    ``incremental``:
+      * ``False``      — full init / reinit: fetch + embed every item.
+      * ``True``       — incremental sync: only items modified since
+                         ``last_sync_time``.
+      * ``"resume"``   — resume an interrupted sync: fetch all items but SKIP
+                         those that already have chunks (indexed before the
+                         interruption). Saves re-embedding ~5000 items when
+                         only a few hundred remain.
     """
     with _project_lock(project_id):
         _sync_project_locked(project_id, job_id=job_id, incremental=incremental)
 
 
 def _sync_project_locked(project_id: int, *, job_id: str | None,
-                         incremental: bool) -> None:
-    """Download, clean, chunk, embed and index a project's items."""
+                         incremental: bool | str) -> None:
+    """Download, clean, chunk, embed and index a project's items.
+
+    ``incremental`` modes:
+      * ``False``      — full init: fetch and index every item.
+      * ``True``       — incremental: only items modified after last_sync_time.
+      * ``"resume"``   — resume an interrupted sync: fetch all items but SKIP
+                         those that already have chunks (indexed before the
+                         interruption). Saves re-embedding ~5000 items when
+                         only a few hundred remain.
+    """
     conn = db()
     last_sync = None
-    if incremental:
+    if incremental is True:
         proj = get_project(conn, project_id)
         last_sync = proj["last_sync_time"] if proj else None
+    # Resume mode: build the skip-set of already-indexed item_ids (items that
+    # have chunks). These are skipped during fetch — no re-download, no
+    # re-embed. The `done` counter starts at this count so progress reflects
+    # true completion, not just this run's work.
+    skip_ids: set[int] = set()
+    if incremental == "resume":
+        skip_ids = indexed_item_ids(conn, project_id)
+        if skip_ids:
+            log.info("Resume sync for project %s: skipping %d already-indexed "
+                     "items.", project_id, len(skip_ids))
+            if job_id:
+                update_job(conn, job_id, done=len(skip_ids),
+                           message=f"Resuming: {len(skip_ids)} items already "
+                                   f"indexed, fetching the rest")
     upsert_project(conn, project_id, status="INITIALIZING")
 
     # ---- Step 1: pre-download ML models BEFORE any indexing work. ----
@@ -346,7 +379,10 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
     # overwritten — no duplicates, no lost data). Items sitting in the queue at
     # crash time were never written, so they're simply re-fetched on resume.
     import queue
-    max_items = settings.sync.max_items_per_run if incremental else None
+    # max_items caps how many items a single run processes. Only incremental
+    # sync (True) uses it as a safety valve; full init (False) and resume
+    # ("resume") process every matching item with no cap.
+    max_items = settings.sync.max_items_per_run if incremental is True else None
     dl_concurrency = settings.sync.download_concurrency
     batch_size = settings.embedding.batch_size
     total_holder: list[int] = [0]  # set by on_total callback
@@ -364,12 +400,23 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
                                f"(Test Runs/Folders/Attachments excluded)")
 
     def _fetcher() -> None:
-        """Download thread: pull items concurrently, chunk them, enqueue."""
+        """Download thread: pull items concurrently, chunk them, enqueue.
+
+        In resume mode, items whose item_id is in ``skip_ids`` (already have
+        chunks) are skipped entirely — no re-download, no re-embed, no enqueue.
+        This is what makes resume fast: 4850/5079 indexed → only 229 fetched.
+        """
         try:
             for item in client.iter_project_items(
                     project_id, modified_after=last_sync,
                     max_items=max_items, concurrency=dl_concurrency,
                     on_total=_on_total):
+                # Resume: skip items that already have chunks (indexed before
+                # the interruption). The item metadata is already in the items
+                # table (upserted in the prior run); only items WITHOUT chunks
+                # need re-processing.
+                if skip_ids and item.get("item_id") in skip_ids:
+                    continue
                 try:
                     chunks = chunk_item(item)
                 except Exception as exc:
@@ -385,7 +432,9 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
         finally:
             item_queue.put(None)  # sentinel: no more items
 
-    done = 0
+    # In resume mode, `done` starts at the count of already-indexed items so
+    # progress (done/total) reflects true completion, not just this run's work.
+    done = len(skip_ids)
     chunk_total = 0
 
     def _embed_and_store(batch: list[tuple[dict, list[dict]]]) -> None:
@@ -500,7 +549,7 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
              project_id, done, chunk_total)
 
 
-def _run_job(project_id: int, job_id: str, incremental: bool) -> None:
+def _run_job(project_id: int, job_id: str, incremental: bool | str) -> None:
     """Background worker: runs sync then guarantees terminal job state.
 
     The error path is defensive: if marking the job/project ERROR itself fails
@@ -604,6 +653,77 @@ def _run_bootstrap_job(job_id: str) -> None:
 # --------------------------------------------------------------------------- #
 # MCP Tools
 # --------------------------------------------------------------------------- #
+def sync_project_blocking(project_id: int, *, incremental: bool | str = False,
+                          poll_interval: float = 60.0) -> dict:
+    """Run a project sync synchronously (blocking) and return the final state.
+
+    Unlike ``init_jama_project`` (which submits to ``_executor`` and returns
+    immediately), this runs ``_run_job`` on the **calling thread** — so the
+    process stays alive until the sync finishes. This is the correct entry
+    point for standalone scripts (``python init_lyra.py``): a ``python -c``
+    one-shot that calls ``init_jama_project`` exits immediately, triggering
+    ``ThreadPoolExecutor`` shutdown which kills the background worker mid-sync.
+    Here the main thread is blocked inside ``_run_job``, so no shutdown fires.
+
+    A daemon progress-polling thread prints ``done/total (pct%)`` every
+    ``poll_interval`` seconds so the user sees live progress.
+
+    Args:
+        project_id: Jama project id (int).
+        incremental: False (full init), True (incremental), or "resume"
+                     (skip already-indexed items — use after an interruption).
+        poll_interval: seconds between progress prints (default 60).
+
+    Returns:
+        {"job_id", "status", "done", "total", "item_count", "chunk_count"}
+    """
+    not_ready = _ensure_ready({"jama", "embedding"})
+    if not_ready:
+        return not_ready
+    conn = db()
+    kind = "resume" if incremental == "resume" else "init"
+    job_id = f"{kind}-{uuid.uuid4().hex[:12]}"
+    with _init_lock:
+        create_job(conn, job_id, project_id, kind)
+        upsert_project(conn, project_id, status="INITIALIZING")
+
+    # Progress poller: daemon thread printing job state every poll_interval.
+    import threading as _t
+    stop = _t.Event()
+
+    def _poll():
+        while not stop.wait(poll_interval):
+            try:
+                row = get_job(conn, job_id)
+            except Exception:
+                continue
+            if row is None:
+                continue
+            tot = row["total"] or "?"
+            pct = round(row["progress"] * 100, 1)
+            log.info("[poll] %s  %s/%s  (%s%%)  %s", row["status"],
+                     row["done"], tot, pct, row["message"] or "")
+
+    poller = _t.Thread(target=_poll, daemon=True, name="sync-poll")
+    poller.start()
+    try:
+        _run_job(project_id, job_id, incremental)
+    finally:
+        stop.set()
+        poller.join(timeout=2)
+
+    row = get_job(conn, job_id)
+    proj = get_project(conn, project_id)
+    return {
+        "job_id": job_id,
+        "status": row["status"] if row else "UNKNOWN",
+        "done": row["done"] if row else 0,
+        "total": row["total"] if row else 0,
+        "item_count": proj["item_count"] if proj else 0,
+        "chunk_count": proj["chunk_count"] if proj else 0,
+    }
+
+
 def _start_sync_job(pid: int, kind: str) -> dict:
     """Create a full (non-incremental) sync job for ``pid`` and submit it.
 
@@ -1706,10 +1826,13 @@ def _resume_interrupted_syncs() -> None:
     A sync that was interrupted by a crash/process kill leaves the project in
     INITIALIZING with a stale (or absent) last_sync_time. Already-flushed items
     are safely persisted (each flush commits), but the project was never marked
-    READY, so it must be re-synced to guarantee completeness. Because upsert is
-    idempotent, re-processing already-indexed items is harmless — they're just
-    overwritten. We kick off a background incremental=False re-sync for each
-    stuck project so the server comes back up consistent without manual action.
+    READY, so it must be re-synced to guarantee completeness.
+
+    Uses ``incremental="resume"`` mode: items that already have chunks are
+    SKIPPED (no re-download, no re-embed), so only the items that were in-flight
+    or not-yet-fetched when the crash happened are re-processed. This turns a
+    ~15min full re-sync of a 5000-item project into a seconds-fast resume when
+    most items were already indexed. upsert is idempotent regardless.
     """
     conn = db()
     stuck = conn.execute(
@@ -1721,9 +1844,9 @@ def _resume_interrupted_syncs() -> None:
         pid = row["project_id"]
         job_id = f"resume-{uuid.uuid4().hex[:12]}"
         log.warning("Recovery: project %s was left INITIALIZING (crash during "
-                    "sync); re-queuing full sync as job %s", pid, job_id)
+                    "sync); re-queuing resume sync as job %s", pid, job_id)
         create_job(conn, job_id, pid, "init")
-        _executor.submit(_run_job, pid, job_id, incremental=False)
+        _executor.submit(_run_job, pid, job_id, incremental="resume")
 
 
 def _warn_if_models_missing() -> None:

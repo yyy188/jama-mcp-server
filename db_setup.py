@@ -474,6 +474,41 @@ def count_items(conn: sqlite3.Connection, project_id: int) -> int:
     ).fetchone()[0]
 
 
+def indexed_item_ids(conn: sqlite3.Connection, project_id: int) -> set[int]:
+    """Return the set of item_ids that already have chunks indexed.
+
+    Used by resume-mode sync to skip items that were fully indexed before an
+    interruption — only items WITHOUT chunks are re-fetched and re-embedded.
+    Reads from the ``chunks`` table (not ``items``) so an item that was
+    upserted (metadata only) but never got its chunks written is NOT skipped
+    (it still needs embedding). The ``idx_chunks_project`` index makes this a
+    cheap scan.
+    """
+    return {
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT item_id FROM chunks WHERE project_id=?",
+            (project_id,)
+        )
+    }
+
+
+def indexed_item_ids(conn: sqlite3.Connection, project_id: int) -> set[int]:
+    """Return the set of item_ids that already have chunks indexed.
+
+    Used by the resume mode of ``_sync_project_locked`` to skip items whose
+    text + FTS + vector data is already written — so an interrupted sync
+    doesn't re-fetch and re-embed the whole project. An item is "indexed"
+    when it has at least one row in ``chunks`` (the unit of retrieval); items
+    with metadata-only rows in ``items`` but no chunks are NOT skipped, so a
+    partial write (item upserted but chunks not yet written) is retried.
+
+    ``idx_chunks_item`` (on ``chunks.item_id``) makes this a cheap indexed scan.
+    """
+    return {row[0] for row in conn.execute(
+        "SELECT DISTINCT item_id FROM chunks WHERE project_id=?", (project_id,)
+    )}
+
+
 def create_job(conn: sqlite3.Connection, job_id: str, project_id: int,
                kind: str) -> None:
     with write_txn(conn):
