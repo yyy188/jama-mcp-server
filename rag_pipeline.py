@@ -877,14 +877,17 @@ class RAGPipeline:
         """Embed a flat list of chunks, packing them into full API batches.
 
         Unlike calling ``embed_chunks`` once per item (which underfills each
-        HTTP request when items have only 1-3 chunks), this batches across
+        embedding request when items have only 1-3 chunks), this batches across
         items: it walks the whole chunk list in ``batch_size`` slices and
         issues embedding requests for each slice. For a project with ~1.4
-        chunks/item and ``batch_size=64`` this cuts the number of HTTP round
-        trips ~45x, turning minutes of serial network wait into seconds.
+        chunks/item and ``batch_size=32`` this cuts the number of embedding
+        round trips ~45x, turning minutes of serial wait into seconds.
 
-        When ``EMBEDDING_CONCURRENCY > 1`` (default 4) the batches are fired
-        concurrently, cutting indexing wall-time a further ~3-4x.
+        Concurrency: for the ``azure`` provider (``EMBEDDING_CONCURRENCY``>1,
+        default 2) the batches are fired concurrently, cutting wall-time a
+        further ~3-4x. For the default ``local`` CPU provider concurrency is
+        ignored — a single ONNX session already saturates the capped threads,
+        so serial batched embed is both the correct and fastest path here.
 
         Embeddings are returned position-aligned with the input ``chunks``
         so callers can ``zip(chunks, embeddings)`` directly.

@@ -503,8 +503,15 @@ class JamaClient:
             "status": status,
             "description": desc,
             "test_steps": steps,
-            "modified_date": raw.get("modifiedDate"),
-            "created_date": raw.get("createdDate"),
+            # Normalize to a fixed-width UTC form so lexicographic comparison
+            # against the user-supplied modified_after/before bounds (normalized
+            # the same way in db_setup._normalize_iso_utc) is correct, including
+            # at the exact boundary. Jama emits ".000+0000" (3 frac digits);
+            # the normalized form is ".000000+0000" (6). Without normalization
+            # a stored value equal to the bound compares LESS than the bound
+            # ("+" < "0" at the frac-digit position) and is wrongly excluded.
+            "modified_date": _normalize_date(raw.get("modifiedDate")),
+            "created_date": _normalize_date(raw.get("createdDate")),
             "raw_json": _safe_dumps(raw),
         }
 
@@ -581,12 +588,23 @@ class JamaClient:
         ``/``. Query strings (``?``) and fragments (``#``) are rejected —
         callers must pass query parameters via ``params`` so they are properly
         URL-encoded — and absolute URLs are rejected to prevent SSRF.
+        Network-path references (``//host``) are also rejected: they pass the
+        ``startswith('/')`` and ``no '://'`` checks but a leading ``//`` is a
+        schemeless URL form that requests would resolve against a host, so it
+        is blocked defensively even though the prefixed base URL makes true
+        SSRF unlikely here.
         """
         if not isinstance(path, str) or not path:
             raise ValueError("path must be a non-empty string")
         p = path.strip()
         if not p.startswith("/"):
             raise ValueError("path must start with '/' (a relative REST path)")
+        if p.startswith("//"):
+            # A leading "//" is a network-path reference (schemeless URL),
+            # not a REST sub-path. Reject it so the path can't be interpreted
+            # as a different host after URL joining.
+            raise ValueError("path must not start with '//' (network-path "
+                             "references are not allowed)")
         if "://" in p:
             raise ValueError("path must be relative, not an absolute URL")
         if "?" in p or "#" in p:
@@ -916,3 +934,56 @@ def _safe_dumps(obj: Any) -> str:
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f+0000")
+
+
+# Fixed-width UTC timestamp form used for stored modified_date / created_date.
+# MUST match db_setup._normalize_iso_utc output so lexicographic comparison
+# between stored values and user-supplied modified_after/before bounds (which
+# go through _normalize_iso_utc) is correct — including at the exact boundary.
+_NORM_TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%f+0000"
+
+
+def _normalize_date(ts: str | None) -> str | None:
+    """Normalize a Jama timestamp to the canonical fixed-width UTC form.
+
+    Jama emits ``2015-10-22T09:22:56.000+0000`` (3 fractional digits); this
+    returns ``2015-10-22T09:22:56.000000+0000`` (6). Mirrors
+    ``db_setup._normalize_iso_utc`` (same formats, same output shape) so stored
+    ``modified_date`` values compare correctly against the user-supplied
+    ``modified_after``/``before`` bounds, which are normalized the same way —
+    including at the exact boundary (without this, Jama's ``.000+0000`` would
+    compare less than the bound's ``.000000+0000`` because ``+`` (ASCII 43) <
+    ``0`` (ASCII 48) at the fractional-digit position, excluding an item whose
+    modifiedDate equals the bound).
+
+    Kept here (rather than importing db_setup) to avoid a circular dependency:
+    db_setup imports config, and jama_client already imports config + net_guard.
+    ``None``/empty pass through so callers can store NULL for items missing a
+    modifiedDate. A parse failure returns the original string unchanged rather
+    than raising — a malformed date should not abort a whole item ingest, and
+    the raw value is still orderable.
+    """
+    if not ts:
+        return None
+    s = ts.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).strftime(_NORM_TS_FORMAT)
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime(_NORM_TS_FORMAT)
+    except ValueError:
+        return ts  # unparseable: keep raw so it's still orderable, not lost

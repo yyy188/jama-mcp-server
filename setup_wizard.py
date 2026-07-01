@@ -157,7 +157,13 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.non_interactive:
-        values = {k: os.environ.get(k, "") for k, *_ in _required_vars() + OPTIONAL_VARS}
+        # Only carry forward vars that are actually SET in the environment.
+        # Including blanks (``{"K": ""}``) would make write_env_file emit
+        # ``KEY=`` lines, which override code defaults (e.g. an empty
+        # RERANKER_MODEL= breaks reranker load). Unset keys are omitted from
+        # the written .env so config.py's code defaults apply.
+        values = {k: os.environ[k] for k, *_ in _required_vars() + OPTIONAL_VARS
+                  if os.environ.get(k)}
     else:
         values = _collect()
 

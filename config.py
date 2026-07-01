@@ -220,10 +220,15 @@ class SyncSettings:
 
 @dataclass(frozen=True)
 class ChunkSettings:
-    """RecursiveCharacterTextSplitter tuning (data is 100% English, ~30% long)."""
+    """LlamaIndex SentenceSplitter tuning (data is 100% English, ~30% long).
+
+    ``make_splitter`` in rag_pipeline.py builds the actual SentenceSplitter from
+    ``chunk_size`` / ``chunk_overlap`` (plus a paragraph separator and a
+    secondary sentence regex hardcoded there, since SentenceSplitter takes those
+    as constructor kwargs rather than a generic ``separators`` list).
+    """
     chunk_size: int = _get_int("CHUNK_SIZE", 512)
     chunk_overlap: int = _get_int("CHUNK_OVERLAP", 80)
-    separators: tuple = field(default=("\\n\\n", "\\n", ". ", "? ", "! ", " ", ""))
 
 
 # NOTE: ``Settings`` is intentionally NOT frozen so that ``reload_settings()``
@@ -336,38 +341,102 @@ def validate_config() -> list[dict]:
     return issues
 
 
-# All env keys the wizard knows how to write, in output order. Values come from
-# os.environ at write time; missing ones are emitted as blank lines so the file
-# stays a complete, self-documenting template.
+# All env keys the wizard/configure_jama can persist, in output order. This list
+# MUST stay in sync with every ``_get*``/``os.environ`` read above — a key read
+# by config but absent here is silently dropped by ``write_env_file`` (which only
+# emits keys in this list). The two most consequential omissions historically
+# were ``EMBEDDING_PROVIDER`` (a rewritten .env lost the azure->local switch and
+# silently reverted to the default) and ``RERANKER_MODEL`` (emitted as a blank
+# ``RERANKER_MODEL=`` line, which ``_get`` returns as ``""`` — overriding the
+# code default and crashing reranker load with "Repo id must use alphanumeric...").
+# Section headers are written as comments by ``write_env_file`` via ``_ENV_HEADERS``.
 _ENV_KEYS = [
+    # --- Jama REST API ---
     "JAMA_URL", "JAMA_CLIENT_ID", "JAMA_CLIENT_SECRET", "JAMA_API_PREFIX",
-    "JAMA_PAGE_SIZE", "JAMA_PAGE_DELAY",
+    "JAMA_PAGE_SIZE", "JAMA_PAGE_DELAY", "JAMA_REQUEST_TIMEOUT",
+    "JAMA_MAX_RETRIES", "JAMA_MIN_BYTES_PER_SEC", "JAMA_SPEED_TEST_TIMEOUT",
+    "JAMA_PAGE_MIN_BYTES_PER_SEC", "JAMA_PAGE_MAX_RETRIES",
+    # --- Embedding provider ---
+    "EMBEDDING_PROVIDER", "EMBEDDING_LOCAL_MODEL", "EMBEDDING_CPU_PERCENT",
+    "EMBEDDING_DOWNLOAD_MIN_BPS", "EMBEDDING_BATCH_SIZE",
+    "EMBEDDING_CONCURRENCY", "EMBEDDING_TIMEOUT",
+    # --- Azure embedding (only used when EMBEDDING_PROVIDER=azure) ---
     "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
     "EMBEDDING_DIMENSIONS", "EMBEDDING_KEY_HEADER",
-    "RERANKER_MODEL", "RERANKER_DEVICE", "RERANKER_ALLOW_FALLBACK",
+    # --- Local cross-encoder reranker (CPU) ---
+    "RERANKER_MODEL", "RERANKER_DEVICE", "RERANKER_BATCH_SIZE",
+    "RERANKER_MAX_LENGTH", "RERANKER_ALLOW_FALLBACK",
+    # --- Storage ---
     "JAMA_MCP_DB_PATH", "SQLITE_BUSY_TIMEOUT_MS",
-    "SYNC_ENABLED", "SYNC_INTERVAL_HOURS",
+    # --- Incremental sync ---
+    "SYNC_ENABLED", "SYNC_INTERVAL_HOURS", "SYNC_MAX_ITEMS_PER_RUN",
+    "SYNC_DOWNLOAD_CONCURRENCY",
+    # --- Chunking ---
     "CHUNK_SIZE", "CHUNK_OVERLAP",
 ]
+
+# Comment headers inserted before each logical group in the written .env, so the
+# file stays self-documenting. Keys not preceded by a header get no comment line.
+_ENV_HEADERS: dict[str, str] = {
+    "JAMA_URL": "Jama REST API",
+    "EMBEDDING_PROVIDER": "Embedding provider",
+    "EMBEDDING_BASE_URL": "Azure embedding (only used when EMBEDDING_PROVIDER=azure)",
+    "RERANKER_MODEL": "Local cross-encoder reranker (CPU)",
+    "JAMA_MCP_DB_PATH": "Storage",
+    "SYNC_ENABLED": "Incremental sync",
+    "CHUNK_SIZE": "Chunking",
+}
 
 
 def write_env_file(values: dict, path: str | None = None) -> str:
     """Write a ``.env`` file from a ``{var: value}`` mapping.
 
-    Only the supplied keys are overridden; everything else is taken from the
-    current environment so a partial wizard run never clobbers existing
-    config. Returns the absolute path written.
+    Only the supplied keys are overridden; for every other key the *current
+    environment* is consulted and the value is written through **only if it is
+    set and non-empty**. A key that is unset in the environment (and not in
+    ``values``, or given as ``None``/``""``) is OMITTED from the file rather than
+    emitted as ``KEY=`` — a present-but-empty env var makes ``_get`` return ``""``,
+    overriding the code default, so emitting blanks would silently break defaults
+    like ``RERANKER_MODEL`` (empty -> reranker load fails) and
+    ``EMBEDDING_LOCAL_MODEL``. Returns the absolute path written.
     """
     target = Path(path) if path else PROJECT_ROOT / ".env"
-    merged = {k: os.environ.get(k, "") for k in _ENV_KEYS}
-    merged.update({k: ("" if v is None else str(v)) for k, v in values.items()})
+    # Effective value per key: caller override wins; otherwise the live env var
+    # (only if set + non-empty, so we don't write blank lines that clobber code
+    # defaults). An explicitly-empty override ("" / None) is treated as "unset"
+    # rather than written as ``KEY=`` — none of these vars have a meaningful
+    # empty value, and an empty ``RERANKER_MODEL=`` would break reranker load.
+    eff: dict[str, str] = {}
+    for k in _ENV_KEYS:
+        v = values.get(k)
+        if k in values and v not in (None, ""):
+            eff[k] = str(v)
+        elif k in os.environ and os.environ[k] != "":
+            eff[k] = os.environ[k]
+        # else: leave unset -> omitted from the file -> code default applies
+    # Caller may also set a key NOT in _ENV_KEYS (escape hatch); write those too
+    # so configure_jama never silently drops a value the user explicitly passed.
+    for k, v in values.items():
+        if k not in eff and v not in (None, ""):
+            eff[k] = str(v)
     lines = [
         "# Jama MCP Server environment (managed by setup_wizard / configure_jama).",
         "# Copy to .env and fill in. All values are read by config.py.",
+        "# Keys left out of this file fall back to the code defaults in config.py.",
         "",
     ]
     for k in _ENV_KEYS:
-        lines.append(f"{k}={merged.get(k, '')}")
+        if k in _ENV_HEADERS:
+            lines.append(f"# --- {_ENV_HEADERS[k]} ---")
+        if k in eff:
+            lines.append(f"{k}={eff[k]}")
+        # Unset + no default-override -> omitted (code default applies)
+    # Any extra caller-supplied keys not in _ENV_KEYS, appended at the end.
+    extra = [k for k in values if k not in _ENV_KEYS and values[k] is not None]
+    if extra:
+        lines.append("# --- Additional keys ---")
+        for k in extra:
+            lines.append(f"{k}={values[k]}")
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(target)
 

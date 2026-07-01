@@ -22,8 +22,9 @@ between semantic search and structured metadata queries.
             │                                                              │
             └──────────────────────────────────────────────────────────────┘
                          │                        │
-                  Jama REST API            Azure OpenAI embeddings
-                  (read-only GET)          (text-embedding-3-small)
+                  Jama REST API            Local CPU embeddings (default:
+                  (read-only GET)          bge-small-en-v1.5) + Azure OpenAI
+                                           (optional, text-embedding-3-small)
 ```
 
 ## Retrieval pipeline (`search_jama_semantics`)
@@ -89,10 +90,13 @@ Handles pagination internally, returns up to 20 core metadata records.
 ## Incremental sync
 
 On startup, APScheduler registers a job (every 2h by default) that reads the
-`projects` table for initialized `project_id` + `last_sync_time`, then walks
-Jama items whose `modifiedDate > last_sync_time`, re-cleans/re-chunks them and
-updates the FTS5 + sqlite-vec indexes. New items are added; modified items have
-their old chunks replaced atomically.
+`projects` table for projects in `READY` status (`INITIALIZING` is deliberately
+excluded — those are handled by crash recovery) along with their
+`last_sync_time`, then walks Jama items whose `modifiedDate > last_sync_time`,
+re-cleans/re-chunks them and updates the FTS5 + sqlite-vec indexes. New items
+are added; modified items have their old chunks replaced atomically. A project
+that already has an in-flight job is skipped so a scheduled sync never races a
+user-initiated one.
 
 ## Setup
 
@@ -162,10 +166,12 @@ On startup the server logs a hint if the models aren't cached yet.
 
 Every MCP tool runs an offline **pre-flight check** before doing any work:
 Python dependencies, required env vars (JAMA_URL / JAMA_CLIENT_ID /
-JAMA_CLIENT_SECRET / EMBEDDING_BASE_URL / EMBEDDING_API_KEY) and the SQLite
-store. If anything is missing the tool returns a clear error dict with a
-`hint` instead of failing midway through a Jama API call. Configure via the
-wizard, or call the `configure_jama` / `validate_setup` tools at runtime.
+JAMA_CLIENT_SECRET — plus EMBEDDING_BASE_URL / EMBEDDING_API_KEY only when
+EMBEDDING_PROVIDER=azure; the default `local` CPU provider needs no embedding
+credentials) and the SQLite store. If anything is missing the tool returns a
+clear error dict with a `hint` instead of failing midway through a Jama API
+call. Configure via the wizard, or call the `configure_jama` / `validate_setup`
+tools at runtime.
 
 ### MCP client config (Claude Desktop example)
 
@@ -269,6 +275,8 @@ so the monitor never shows a phantom in-flight job.
 | `rag_pipeline.py` | chunking, embeddings, Multi-Query, hybrid recall, RRF, rerank |
 | `server.py` | MCP tools, async jobs, APScheduler incremental sync, pre-flight guards |
 | `preflight.py` | offline dependency + config + storage validation |
+| `net_guard.py` | pre-download bandwidth speed test (`NetworkTooSlowError`) |
+| `bootstrap.py` | foreground model pre-download CLI (`python bootstrap.py`) |
 | `setup_wizard.py` | interactive configuration wizard (`python setup_wizard.py`) |
 | `selftest.py` | end-to-end self-test suite (`python selftest.py`) |
 | `.env.example` | template for environment configuration |
@@ -290,6 +298,7 @@ so the monitor never shows a phantom in-flight job.
 - `list_jama_releases(project_id)` — project releases/versions.
 - `list_jama_test_runs(project_id?, test_cycle_id?)` — test runs.
 - `list_jama_item_types()` — tenant item types (id → name).
+- `find_jama_item_type_by_name(name, exact?)` — find item types by display name → get the id needed by item_type filters.
 - `query_jama_endpoint(path, params?, all_pages?)` — generic read-only GET escape hatch.
 
 **RAG / retrieval / sync monitoring**
@@ -304,12 +313,14 @@ so the monitor never shows a phantom in-flight job.
 
 ## Verified
 
-All components self-tested against the live Jama instance and embedding API:
-OAuth + paginated fetch, HTML→text cleaning, Test Case step rendering,
-item-type mapping, DB schema (FTS5 + vec0), full RAG search, async init with
-progress polling, incremental sync (0 new items), native metadata filters
-(item_type / status / keyword / document_key), APScheduler startup, MCP stdio
-handshake, and error paths (bad project id, unknown job, nonexistent project).
+All components self-tested against the live Jama instance and the local CPU
+embedding backend: OAuth + paginated fetch, HTML→text cleaning, Test Case step
+rendering, item-type mapping, DB schema (FTS5 + vec0), full RAG search, async
+init with progress polling, incremental sync (0 new items), concurrent
+download + batched embed, crash recovery (INITIALIZING → auto-resynced READY),
+native metadata filters (item_type / status / keyword / document_key),
+APScheduler startup, MCP stdio handshake, and error paths (bad project id,
+unknown job, nonexistent project, missing args).
 
 The **cross-encoder reranker** (ms-marco-MiniLM-L-6-v2) was downloaded from the
 HuggingFace China mirror (`hf-mirror.com`) and loaded on CPU; verified it produces non-zero relevance

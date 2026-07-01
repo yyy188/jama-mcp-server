@@ -66,4 +66,5 @@ setuptools<81
 
 # --- Utilities ---
 python-dotenv>=1.0.0
-tenacity>=8.2.0
+# (tenacity was previously listed but is not imported anywhere in this codebase —
+#  all HTTP retry logic uses urllib3.Retry. Removed to keep the dependency set honest.)

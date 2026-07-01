@@ -33,7 +33,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from mcp.server.fastmcp import FastMCP
 
 from config import reload_settings, settings, write_env_file
-from db_setup import (count_chunks, create_job, get_active_job_for_project,
+from db_setup import (count_chunks, count_items, create_job,
+                      get_active_job_for_project,
                       get_connection, get_job, get_latest_job_for_project,
                       get_project, init_db, list_initialized_projects,
                       reconcile_stale_jobs, update_job, upsert_item,
@@ -333,8 +334,6 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
     # overwritten — no duplicates, no lost data). Items sitting in the queue at
     # crash time were never written, so they're simply re-fetched on resume.
     import queue
-    import threading
-    pipeline = rag()
     max_items = settings.sync.max_items_per_run if incremental else None
     dl_concurrency = settings.sync.download_concurrency
     batch_size = settings.embedding.batch_size
@@ -465,14 +464,22 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
         if job_id:
             update_job(conn, job_id, status="DONE", progress=1.0,
                        done=0, message="No new/modified items")
+        # Report the true persisted totals (an incremental run that found 0
+        # changes must NOT clobber item_count with the per-run ``done``=0).
         upsert_project(conn, project_id, name=proj_name, status="READY",
-                       last_sync_time=utcnow_iso())
+                       last_sync_time=utcnow_iso(),
+                       item_count=count_items(conn, project_id),
+                       chunk_count=count_chunks(conn, project_id))
         return
 
     final_chunk_count = count_chunks(conn, project_id)
+    # ``done`` is the count processed THIS run. For an incremental sync that's
+    # only the modified items, not the project total — read the true total from
+    # the items table so get_sync_status stays accurate after both run kinds.
     upsert_project(conn, project_id, name=proj_name, status="READY",
                    last_sync_time=utcnow_iso(),
-                   item_count=done, chunk_count=final_chunk_count)
+                   item_count=count_items(conn, project_id),
+                   chunk_count=final_chunk_count)
     if job_id:
         update_job(conn, job_id, status="DONE", progress=1.0, done=done,
                    message=f"Done: {done} items, {chunk_total} chunks "
@@ -1050,7 +1057,7 @@ def search_jama_semantics(project_id: str, query: str,
 
 @mcp.tool()
 def query_jama_native_metadata(project_id: str, document_key: str = None,
-                               item_type: int = None, status: str = None,
+                               item_type: str = None, status: str = None,
                                keyword: str = None) -> dict:
     """Query Jama's native REST API directly for exact metadata filtering.
 
@@ -1065,7 +1072,10 @@ def query_jama_native_metadata(project_id: str, document_key: str = None,
     Args:
         project_id: numeric string Jama project id.
         document_key: exact Jama document key (e.g. "SA-TC-7").
-        item_type: Jama item-type id (e.g. 89011 = Test Case).
+        item_type: Jama item-type id as a numeric string (e.g. "89011" for Test
+                   Case). Pass None for all types. Kept as a string (not int)
+                   to match `search_jama_semantics` and the other MCP tools,
+                   which all take ids as numeric strings.
         status: exact status string (e.g. "BLOCKED", "APPROVED").
         keyword: full-text 'contains' filter delegated to Jama.
 
@@ -1080,9 +1090,19 @@ def query_jama_native_metadata(project_id: str, document_key: str = None,
         pid = int(project_id)
     except (TypeError, ValueError):
         return {"error": "project_id must be a numeric string"}
+    # Normalize item_type to int (or None), matching search_jama_semantics.
+    # The schema declares it as a string so the tool surface stays consistent
+    # across all id-bearing parameters (project_id / item_type / item_id are
+    # all numeric strings); convert here before handing to the REST client.
+    it = None
+    if item_type is not None and str(item_type).strip():
+        try:
+            it = int(item_type)
+        except (TypeError, ValueError):
+            return {"error": "item_type must be a numeric string or null"}
     try:
         rows = jama().query_items_native(
-            pid, document_key=document_key, item_type=item_type,
+            pid, document_key=document_key, item_type=it,
             status=status, keyword=keyword, limit=20)
     except Exception as exc:
         log.error("native query failed: %s\n%s", exc, traceback.format_exc())
@@ -1723,7 +1743,9 @@ def _warn_if_models_missing() -> None:
 
 def main() -> None:
     # Eagerly initialize the DB so schema/extension errors surface at startup.
-    init_db()
+    # Reuse the shared singleton connection — calling init_db() standalone here
+    # would open (and leak) a SECOND connection alongside db()'s lazy one.
+    db()
     # Clear crash-leftover RUNNING jobs before any worker runs, so the monitor
     # never reports a phantom in-flight job. Must precede _resume_interrupted_syncs
     # so resumed INITIALIZING projects get a fresh job row rather than reusing a
