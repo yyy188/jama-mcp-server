@@ -34,14 +34,15 @@ _CORE_DEPS = [
 _OPTIONAL_DEPS = [
     ("mcp", "MCP framework (FastMCP)"),
     ("llama_index.core", "LlamaIndex chunking"),
-    ("transformers", "local cross-encoder reranker"),
-    ("torch", "local cross-encoder reranker"),
 ]
 
-# Provider-specific embedding deps. Only required for the active provider.
+# Provider-specific embedding deps. fastembed serves BOTH the local bge
+# embedding AND the cross-encoder reranker (both run on onnxruntime), so it is
+# core for the local provider. azure only needs requests (already in _CORE_DEPS).
 _PROVIDER_DEPS = {
-    "local": [("fastembed", "local CPU embedding (bge-small-en-v1.5)")],
-    "azure": [],  # azure uses requests, already in _CORE_DEPS
+    "local": [("fastembed", "local CPU embedding (bge-small-en-v1.5) + "
+                            "cross-encoder reranker (MiniLM, ONNX)")],
+    "azure": [],
 }
 
 
@@ -53,72 +54,12 @@ def _try_import(name: str) -> tuple[bool, str]:
         return False, str(exc)[:200]
 
 
-def _check_torch_env() -> list[str]:
-    """Detect torch environment problems that silently break the reranker.
-
-    The reranker loads ``torch`` + ``transformers``. Two common environment
-    breakages that leave weights on disk but make loading fail (so search
-    silently degrades to RRF):
-
-    1. A CUDA build of torch installed (``+cuXXX``) — ~6GB, depends on a
-       VC++ Runtime absent on many Windows machines (WinError 1114).
-    2. A leftover ``torchaudio``/``torchvision`` from a prior CUDA install
-       whose version doesn't match the installed (CPU) torch — its .pyd
-       pollutes the torch load chain with DLL-not-found errors.
-
-    Returns human-readable warning strings (empty list = healthy). Non-fatal:
-    these are warnings, not blocking errors, because the rest of the server
-    (embedding, browse, native query) still works without a usable torch.
-    """
-    warnings: list[str] = []
-    try:
-        import torch  # type: ignore
-        ver = getattr(torch, "__version__", "")
-        if "+cpu" not in ver and "cpu" not in ver.split("+")[-1:]:
-            # Heuristic: official CPU builds carry the "+cpu" local-version
-            # marker. Anything else (incl. plain "2.x.y" from a mirror, or
-            # "+cuXXX") is suspect on a CPU-only reranker setup.
-            warnings.append(
-                f"torch {ver} is not the CPU build. The CUDA/default build "
-                f"is ~6GB and may fail to load on Windows (WinError 1114). "
-                f"Reinstall with: pip install torch==2.6.0+cpu --index-url "
-                f"https://download.pytorch.org/whl/cpu")
-    except Exception:
-        # torch missing is reported separately by _OPTIONAL_DEPS; nothing to
-        # add here.
-        return warnings
-
-    # Detect version-mismatched torchaudio/torchvision (CUDA leftovers). These
-    # ship .pyd files that reference CUDA DLLs and break transformers' torch
-    # import even when the torch package itself is the CPU build.
-    try:
-        from importlib.metadata import version, PackageNotFoundError
-        for pkg in ("torchaudio", "torchvision"):
-            try:
-                pv = version(pkg)
-            except PackageNotFoundError:
-                continue
-            # A CUDA local-version marker on a companion package means it was
-            # built against CUDA torch; if the installed torch is CPU, the
-            # companion's native libs will fail to load.
-            if "+cu" in pv or "+cu" in ver:
-                if ("+cpu" in ver) != ("+cpu" in pv) or \
-                        (ver.split("+")[0] != pv.split("+")[0]):
-                    warnings.append(
-                        f"{pkg} {pv} does not match torch {ver}. A leftover "
-                        f"CUDA companion package can break reranker loading "
-                        f"via DLL errors. Uninstall it: pip uninstall {pkg}")
-    except Exception:
-        pass  # importlib.metadata quirks across versions; non-fatal.
-    return warnings
-
-
 def check_dependencies() -> dict[str, Any]:
     """Return a structured dependency report.
 
     Shape::
         {"ok": bool, "missing_core": [...], "missing_optional": [...],
-         "env_warnings": [...], "checked": int}
+         "checked": int}
     """
     missing_core: list[dict] = []
     missing_optional: list[dict] = []
@@ -134,19 +75,18 @@ def check_dependencies() -> dict[str, Any]:
         if not ok:
             missing_optional.append({"package": name, "purpose": purpose, "error": err})
     # The active embedding provider has its own required deps. fastembed is
-    # CORE for local (no embedding works without it); azure only needs requests.
+    # CORE for local (no embedding OR reranker works without it); azure only
+    # needs requests.
     provider = settings.embedding.provider
     for name, purpose in _PROVIDER_DEPS.get(provider, []):
         ok, err = _try_import(name)
         checked += 1
         if not ok:
             missing_core.append({"package": name, "purpose": purpose, "error": err})
-    env_warnings = _check_torch_env()
     return {
         "ok": not missing_core,
         "missing_core": missing_core,
         "missing_optional": missing_optional,
-        "env_warnings": env_warnings,
         "checked": checked,
     }
 
@@ -191,12 +131,6 @@ def preflight(*, require: set[str] | None = None) -> dict[str, Any]:
         for m in deps["missing_core"]:
             issues.append(f"Missing core dependency '{m['package']}' ({m['purpose']}). "
                           f"Run: pip install -r requirements.txt")
-
-    # Non-blocking environment warnings (e.g. CUDA torch, mismatched
-    # torchaudio) — these silently break the reranker so surface them, but
-    # don't block tools that don't need torch.
-    for w in deps.get("env_warnings", []):
-        issues.append(f"[env] {w}")
 
     if not storage["ok"]:
         blocking = True

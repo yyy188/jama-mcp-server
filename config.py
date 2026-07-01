@@ -29,31 +29,28 @@ USER_DIR = PROJECT_ROOT / "user"
 USER_DIR.mkdir(parents=True, exist_ok=True)
 
 # Use the HuggingFace China mirror by default so model weights (the ~80MB
-# cross-encoder reranker + ~130MB ONNX embedding model) can be downloaded from
-# inside mainland China. This is read by huggingface_hub / transformers when
-# fetching models. Override with HF_ENDPOINT in the environment if a different
-# mirror is preferred.
+# cross-encoder reranker ONNX + ~130MB ONNX embedding model) can be downloaded
+# from inside mainland China. Both models download via fastembed, which uses
+# huggingface_hub and honours HF_ENDPOINT. Override with HF_ENDPOINT in the
+# environment if a different mirror is preferred.
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 # Default the HF cache to a project-local folder (user/huggingface) so the
-# reranker weights live inside the project, not in the user home dir.
-# Only set if the caller hasn't already configured HF_HOME/HUGGINGFACE_HUB_CACHE.
+# reranker + embedding weights live inside the project, not in the user home
+# dir. Only set if the caller hasn't already configured HF_HOME/HUGGINGFACE_HUB_CACHE.
 os.environ.setdefault("HF_HOME", str(USER_DIR / "huggingface"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(USER_DIR / "huggingface" / "hub"))
-# Disable HF's Xet transfer protocol. fastembed pulls the ONNX model via
+# Disable HF's Xet transfer protocol. fastembed pulls both ONNX models via
 # huggingface_hub, which defaults to the Xet protocol; on some networks it
 # fails mid-transfer. Forcing the plain HTTPS path avoids the failure.
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 # Silence the tqdm "Fetching N files" / per-file progress bars that
-# huggingface_hub (snapshot_download, for the reranker weights) and fastembed
-# (ONNX download) emit. In a non-interactive shell — especially the MCP stdio
+# huggingface_hub (fastembed's ONNX downloads for both the embedding and the
+# reranker) emit. In a non-interactive shell — especially the MCP stdio
 # server, which runs headless — those bars spam thousands of carriage-return
 # lines on stderr and look like a hang. Set here (not just in bootstrap.py) so
 # server-driven syncs and selftest are silenced too; huggingface_hub reads
 # HF_HUB_DISABLE_PROGRESS_BARS lazily on each download.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-# Once weights are cached we prefer offline mode so transient network errors
-# never block reranker loading in production.
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "0")
 
 
 def _get(name: str, default: str = "") -> str:
@@ -168,28 +165,26 @@ class EmbeddingSettings:
 
 @dataclass(frozen=True)
 class RerankerSettings:
-    """Local cross-encoder reranker (CPU).
+    """Local cross-encoder reranker (CPU, ONNX via fastembed).
 
-    Default: ``cross-encoder/ms-marco-MiniLM-L-6-v2`` (~80MB, 6-layer MiniLM).
-    Much smaller than the prior Qwen3-Reranker-0.6B (1.2GB) while giving
-    comparable precision for the top-25 candidate re-ranking this server does
-    (RRF already fuses recall; the reranker only re-sorts the final 25). A
-    cross-encoder scores (query, document) pairs directly via a sequence-
-    classification head — no causal-LM prompt format, no 152k-vocab logits tensor.
+    Default model: ``cross-encoder/ms-marco-MiniLM-L-6-v2`` (~80MB). This is
+    the torch-style name; ``Reranker._resolve_model`` transparently remaps it
+    to its ONNX port (``Xenova/ms-marco-MiniLM-L-6-v2``) so the reranker loads
+    via fastembed/onnxruntime — the SAME runtime the bge embedding model uses —
+    with no torch/transformers dependency (eliminating the Windows
+    c10.dll/WinError 1114 load failure). A user's existing .env that names the
+    torch model keeps working unchanged.
+
+    RRF already fuses recall; the reranker only re-sorts the final 25
+    candidates, so the small MiniLM cross-encoder gives comparable precision to
+    the prior Qwen3-Reranker-0.6B at a fraction of the size. A cross-encoder
+    scores (query, document) pairs directly via a sequence-classification head
+    — no causal-LM prompt format, no large logits tensor.
     """
     model_name: str = _get("RERANKER_MODEL",
                            "cross-encoder/ms-marco-MiniLM-L-6-v2")
-    # Max (query, doc) pairs scored in one forward pass. MiniLM is tiny (~80MB,
-    # 6 layers); batch=16 stays well under 1 GB and keeps re-ranking 25
-    # candidates fast on CPU. (The old Qwen3 causal-LM needed batch=4 because of
-    # its [N, seq, 152k-vocab] logits tensor; a cross-encoder has no such tensor.)
-    batch_size: int = _get_int("RERANKER_BATCH_SIZE", 16)
-    # 256 is ample for (query + chunk) relevance; chunks are already capped at
-    # chunk_size during indexing.
-    max_length: int = _get_int("RERANKER_MAX_LENGTH", 256)
     # If model loading fails, degrade to RRF-only scoring instead of crashing.
     allow_fallback: bool = _get("RERANKER_ALLOW_FALLBACK", "1") == "1"
-    device: str = _get("RERANKER_DEVICE", "cpu")
 
 
 @dataclass(frozen=True)
@@ -363,9 +358,8 @@ _ENV_KEYS = [
     # --- Azure embedding (only used when EMBEDDING_PROVIDER=azure) ---
     "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
     "EMBEDDING_DIMENSIONS", "EMBEDDING_KEY_HEADER",
-    # --- Local cross-encoder reranker (CPU) ---
-    "RERANKER_MODEL", "RERANKER_DEVICE", "RERANKER_BATCH_SIZE",
-    "RERANKER_MAX_LENGTH", "RERANKER_ALLOW_FALLBACK",
+    # --- Local cross-encoder reranker (CPU, ONNX via fastembed) ---
+    "RERANKER_MODEL", "RERANKER_ALLOW_FALLBACK",
     # --- Storage ---
     "JAMA_MCP_DB_PATH", "SQLITE_BUSY_TIMEOUT_MS",
     # --- Incremental sync ---
@@ -381,7 +375,7 @@ _ENV_HEADERS: dict[str, str] = {
     "JAMA_URL": "Jama REST API",
     "EMBEDDING_PROVIDER": "Embedding provider",
     "EMBEDDING_BASE_URL": "Azure embedding (only used when EMBEDDING_PROVIDER=azure)",
-    "RERANKER_MODEL": "Local cross-encoder reranker (CPU)",
+    "RERANKER_MODEL": "Local cross-encoder reranker (CPU, ONNX via fastembed)",
     "JAMA_MCP_DB_PATH": "Storage",
     "SYNC_ENABLED": "Incremental sync",
     "CHUNK_SIZE": "Chunking",

@@ -127,20 +127,20 @@ the rerank reference). This maximizes recall for RRF fusion and is
 preferred over letting the server fall back to lexical variants.
 
 MODEL BOOTSTRAP (first-run, before any init). The embedding model (~130MB
-ONNX) and cross-encoder reranker (~80MB) are NOT bundled — they download on
-first use. Call `bootstrap_models()` right after the server is configured: it
-downloads BOTH models asynchronously and returns a job_id immediately, so the
-first sync isn't slowed by a download and a download failure surfaces here
-instead of mid-sync. Poll `get_bootstrap_progress(job_id)` roughly every 2
-minutes, reporting each sample (status, progress %, message) to the user,
-until status is DONE or ERROR. Progress is phase-based (not live bytes):
-snapshot_download (reranker) and fastembed (embedding) both lack per-chunk
-byte callbacks, so `message` reports phase transitions (e.g. "Downloading
-reranker model (...)" -> "Reranker model ready") rather than byte counts.
-Already-cached models are skipped, so re-running bootstrap after success is a
-fast no-op. OPTIONAL: if skipped, init/sync still works (downloads on demand)
-but the first sync is slower and a download failure surfaces mid-sync —
-prefer running bootstrap first.
+ONNX) and cross-encoder reranker (~80MB ONNX) are NOT bundled — they download
+on first use. Both run on onnxruntime via fastembed (no torch dependency).
+Call `bootstrap_models()` right after the server is configured: it downloads
+BOTH models asynchronously and returns a job_id immediately, so the first
+sync isn't slowed by a download and a download failure surfaces here instead
+of mid-sync. Poll `get_bootstrap_progress(job_id)` roughly every 2 minutes,
+reporting each sample (status, progress %, message) to the user, until status
+is DONE or ERROR. Progress is phase-based (not live bytes): fastembed (used
+for both models) lacks per-chunk byte callbacks, so `message` reports phase
+transitions (e.g. "Downloading reranker model (...)" -> "Reranker model
+ready") rather than byte counts. Already-cached models are skipped, so
+re-running bootstrap after success is a fast no-op. OPTIONAL: if skipped,
+init/sync still works (downloads on demand) but the first sync is slower and
+a download failure surfaces mid-sync — prefer running bootstrap first.
 
 SYNC MONITORING. `init_jama_project` (first init) and `reinit_jama_project`
 (re-index an already-initialized project) run in the BACKGROUND and return a
@@ -519,13 +519,12 @@ def _run_bootstrap_job(job_id: str) -> None:
 
     Reports live progress into the ``sync_jobs`` row (kind="bootstrap") so
     ``get_bootstrap_progress`` can be polled every ~2 min. The reranker
-    (~80MB cross-encoder) downloads via ``snapshot_download``, which gives no
-    per-chunk byte callback — so progress is reported as phase transitions
-    (downloading -> ready), not live bytes. The embedding model (~130MB ONNX) goes
-    through fastembed (also no byte callback), likewise phase-only. Either
-    model already cached skips its download. Failures are non-fatal per-model
-    (marked in the message) but the job still ends ERROR if any model is
-    missing at the end.
+    (~80MB cross-encoder, ONNX via fastembed) and the embedding model
+    (~130MB ONNX) both download through fastembed, which gives no per-chunk
+    byte callback — so progress is reported as phase transitions
+    (downloading -> ready), not live bytes. Either model already cached skips
+    its download. Failures are non-fatal per-model (marked in the message) but
+    the job still ends ERROR if any model is missing at the end.
     """
     conn = db()
 
@@ -557,11 +556,11 @@ def _run_bootstrap_job(job_id: str) -> None:
     else:
         _set(0.45, f"Embedding provider is {provider} (no model to download)")
 
-    # --- Phase 2: reranker model (snapshot_download, no byte-level progress) --
-    # snapshot_download (used by ensure_downloaded) gives no per-chunk callback,
-    # so we can't show live bytes — only phase transitions. The progress band
+    # --- Phase 2: reranker model (ONNX via fastembed, no byte-level progress) --
+    # fastembed (used by ensure_downloaded) gives no per-chunk callback, so we
+    # can't show live bytes — only phase transitions. The progress band
     # 0.5..0.95 is held at 0.5 while downloading, then jumps to 0.95 on success.
-    _set(0.5, f"Downloading reranker model ({settings.reranker.model_name}, ~80MB)")
+    _set(0.5, f"Downloading reranker model ({settings.reranker.model_name}, ~80MB ONNX)")
 
     def _reranker_cb(received: int, expected: int | None) -> None:
         # Called once at completion by _ensure_weights_downloaded (snapshot_download
@@ -708,13 +707,14 @@ def bootstrap_models() -> dict:
     """Pre-download the embedding + reranker models so syncs never wait on them.
 
     Downloads the local embedding model (bge-small-en-v1.5, ~130MB ONNX) and the
-    cross-encoder reranker (cross-encoder/ms-marco-MiniLM-L-6-v2, ~80MB) into the
-    project-local cache, ASYNCHRONOUSLY.
-    Returns a job_id immediately. This is the recommended first step after
-    installing/configuring the server — call it BEFORE init_jama_project so the
-    first sync isn't slowed by model downloads. Models already cached are
-    skipped. Poll progress with get_bootstrap_progress roughly every 2 minutes,
-    reporting each sample to the user, until status is DONE or ERROR.
+    cross-encoder reranker (ms-marco-MiniLM-L-6-v2, ~80MB ONNX) into the
+    project-local cache, ASYNCHRONOUSLY. Both run on onnxruntime via fastembed
+    — no torch/transformers dependency. Returns a job_id immediately. This is
+    the recommended first step after installing/configuring the server — call
+    it BEFORE init_jama_project so the first sync isn't slowed by model
+    downloads. Models already cached are skipped. Poll progress with
+    get_bootstrap_progress roughly every 2 minutes, reporting each sample to
+    the user, until status is DONE or ERROR.
 
     Returns:
         {"job_id": "...", "status": "RUNNING"} or, if a bootstrap is already
@@ -761,7 +761,7 @@ def get_bootstrap_progress(job_id: str) -> dict:
     After calling bootstrap_models, poll this roughly every 2 minutes, reporting
     each sample (status, progress %, message) to the user, until status is DONE
     or ERROR. Progress is phase-based, not live bytes: both the embedding
-    (~130MB ONNX, via fastembed) and the reranker (~80MB, via snapshot_download)
+    (~130MB ONNX, via fastembed) and the reranker (~80MB ONNX, via fastembed)
     lack per-chunk byte callbacks, so `message` reports phase transitions (e.g.
     "Downloading reranker model (...)" -> "Reranker model ready") rather than
     byte counts.
@@ -913,9 +913,9 @@ def search_jama_semantics(project_id: str, query: str,
 
     This is the DEFAULT tool for any non-precise question. It fuses keyword
     (FTS5/BM25), vector (sqlite-vec cosine) and RRF in one call, then reranks
-    with a local cross-encoder model — so "like", "keyword" and "semantic" queries are
-    all best answered here. Prefer it over native metadata unless the user
-    gives an exact document key / status / item id.
+    with a local cross-encoder model (ONNX via fastembed/onnxruntime) — so "like",
+    "keyword" and "semantic" queries are all best answered here. Prefer it over
+    native metadata unless the user gives an exact document key / status / item id.
 
     Pipeline: client Multi-Query expansion -> hybrid recall (sqlite-vec +
     FTS5) -> RRF fusion -> local cross-encoder reranker -> top_k results.

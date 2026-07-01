@@ -64,10 +64,11 @@ def _cache_size() -> int:
 class _ProgressReporter:
     """Print periodic cache-size growth while a download runs.
 
-    fastembed / snapshot_download give no usable byte callback, so we poll the
-    cache directory size from a daemon thread and emit one line every ~10s.
-    This gives the user visible movement ("cache grew to 48 MB") instead of a
-    silent multi-minute hang. Stopped via the ``stop()`` event.
+    fastembed (used for both the embedding and the reranker ONNX downloads)
+    gives no usable byte callback, so we poll the cache directory size from a
+    daemon thread and emit one line every ~10s. This gives the user visible
+    movement ("cache grew to 48 MB") instead of a silent multi-minute hang.
+    Stopped via the ``stop()`` event.
     """
 
     def __init__(self, label: str):
@@ -128,7 +129,7 @@ def _download_reranker() -> bool:
         print(f"  reranker model already cached ({settings.reranker.model_name}).")
         return True
     print(f"  downloading reranker model {settings.reranker.model_name} "
-          f"(~80MB) ...")
+          f"(~80MB ONNX) ...")
     before = _cache_size()
     t0 = time.monotonic()
     with _ProgressReporter("reranker download"):

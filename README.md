@@ -40,11 +40,13 @@ between semantic search and structured metadata queries.
 3. **RRF fusion** — Reciprocal Rank Fusion merges all ranked lists into one
    candidate pool of ≤ `candidate_k` unique chunks.
 4. **Rerank** — a local **cross-encoder** (`cross-encoder/ms-marco-MiniLM-L-6-v2`,
-   ~80MB, CPU, via `transformers`) scores `(query, chunk)` pairs via a sequence-
-   classification head; top `top_k` returned. If the model is unavailable, the
-   pipeline gracefully falls back to RRF scores. Model weights are fetched from
-   the HuggingFace China mirror (`HF_ENDPOINT=https://hf-mirror.com`) on first
-   use, then served from cache.
+   ~80MB, CPU, ONNX via fastembed/onnxruntime) scores `(query, chunk)` pairs via
+   a sequence-classification head; top `top_k` returned. It runs on the SAME
+   onnxruntime as the bge embedding model — no torch/transformers dependency,
+   so the Windows `c10.dll`/WinError 1114 load failure is eliminated. If the
+   model is unavailable, the pipeline gracefully falls back to RRF scores.
+   Model weights are fetched from the HuggingFace China mirror
+   (`HF_ENDPOINT=https://hf-mirror.com`) on first use, then served from cache.
 
 ## Reliability & crash recovery
 
@@ -101,14 +103,9 @@ user-initiated one.
 ## Setup
 
 ```bash
-# 1a. Install CPU torch FIRST, on its own, forcing the PyTorch CPU index.
-#     This is the reliable way to get the ~200MB CPU build — installing torch
-#     alongside the rest of the deps can let a mirror hand back the 6GB CUDA
-#     wheel instead (it loads fine but breaks the reranker on Windows via
-#     WinError 1114 and wastes ~6GB of disk).
-pip install torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
-
-# 1b. Then install the rest of the dependencies (Aliyun mirror for speed).
+# 1. Install dependencies (Aliyun mirror for speed; no torch needed — the
+#    reranker runs on onnxruntime via fastembed, the same runtime the bge
+#    embedding model uses).
 pip install -r requirements.txt
 
 # 2. Configure + pre-download models (the wizard writes .env, validates deps +
@@ -120,15 +117,6 @@ python setup_wizard.py --self-test
 python server.py
 ```
 
-> **Upgrading from a prior CUDA torch install?** Uninstall the CUDA packages
-> together, or a leftover `torchaudio`/`torchvision` will keep its CUDA `.pyd`
-> and silently break reranker loading:
-> ```bash
-> pip uninstall torch torchaudio torchvision -y
-> ```
-> Then run step 1a above. The setup wizard's pre-flight (`validate_setup`)
-> now warns about a CUDA torch build or a version-mismatched companion package.
-
 To (re)download just the models later without re-running the wizard:
 
 ```bash
@@ -136,23 +124,24 @@ python bootstrap.py
 ```
 
 The models live in `user/huggingface/` (project-local, ~210MB total: a ~130MB
-ONNX embedding + ~80MB cross-encoder reranker). They're plain data files —
-portable across machines, so you can also copy that folder from another machine
-to skip the download entirely.
+ONNX embedding + ~80MB ONNX cross-encoder reranker). Both run on onnxruntime
+via fastembed — **no torch/transformers dependency**, so the Windows
+`c10.dll`/WinError 1114 load failure that torch triggers is eliminated. The
+model files are plain data — portable across machines, so you can also copy
+that folder from another machine to skip the download entirely.
 
-### Why pinned torch / onnxruntime versions
+### Why pinned onnxruntime versions
 
-`requirements.txt` pins **`torch==2.6.0+cpu`** (from the PyTorch CPU index) and
-**`onnxruntime==1.20.1`** (or `1.21.1` on Python 3.13+) on purpose:
+`requirements.txt` pins **`onnxruntime==1.20.1`** (or `1.21.1` on Python
+3.13+) on purpose:
 
-- The default CUDA `torch` from the Aliyun mirror is ~6 GB and depends on a new
-  VC++ Runtime (`vcruntime140_1.dll`) absent on many Windows machines, causing
-  `WinError 1114` DLL load failures. The CPU build (~200 MB) has no such
-  dependency and is all an ~80MB MiniLM CPU reranker needs.
-- `onnxruntime` 1.27.0 (what `fastembed` pulls on Python 3.13+) triggers the
-  same VC++ DLL issue on Windows. 1.20.1 satisfies `fastembed`'s constraint on
-  Python 3.10–3.12 (`>=1.17.0, !=1.20.0`) and loads cleanly; Python 3.13+ needs
-  `>1.21`, so it's pinned to 1.21.1 there.
+- `onnxruntime` 1.27.0 (what `fastembed` pulls on Python 3.13+) depends on the
+  new VC++ Runtime (`vcruntime140_1.dll`) absent on many Windows machines,
+  causing `WinError 1114` DLL load failures. 1.20.1 satisfies `fastembed`'s
+  constraint on Python 3.10–3.12 (`>=1.17.0, !=1.20.0`) and loads cleanly;
+  Python 3.13+ needs `>1.21`, so it's pinned to 1.21.1 there.
+- Both the embedding and the reranker share this single runtime, so the pin
+  protects the whole ML stack at once.
 
 If you upgrade these, re-test on a clean Windows machine **without** the latest
 VC++ Redistributable installed.
@@ -322,10 +311,13 @@ native metadata filters (item_type / status / keyword / document_key),
 APScheduler startup, MCP stdio handshake, and error paths (bad project id,
 unknown job, nonexistent project, missing args).
 
-The **cross-encoder reranker** (ms-marco-MiniLM-L-6-v2) was downloaded from the
-HuggingFace China mirror (`hf-mirror.com`) and loaded on CPU; verified it produces non-zero relevance
-scores with correct ordering (related=0.55 > unrelated=0.0002) and that the
-end-to-end RAG search returns `strategy=rerank` results. **LlamaIndex** is the
+The **cross-encoder reranker** (ms-marco-MiniLM-L-6-v2, ONNX port via
+fastembed) was downloaded from the HuggingFace China mirror (`hf-mirror.com`)
+and loaded on onnxruntime (no torch); verified it produces non-zero relevance
+scores with correct ordering (a related document scores significantly higher
+than an unrelated one) and that the end-to-end RAG search returns
+`strategy=rerank` results. Scores are the model's raw logits (may be
+negative) — only the relative order is meaningful for re-ranking. **LlamaIndex** is the
 primary RAG framework: `SentenceSplitter` + `Document`/`TextNode` for chunking.
 Multi-Query expansion is performed by the MCP LLM client and passed to the
 pipeline via `search(sub_queries=...)`; when omitted, deterministic lexical

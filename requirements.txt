@@ -3,16 +3,16 @@
 # ---------------------------------------------------------------------
 # Default index: Aliyun mirror (China mainland acceleration).
 # PyPI is the secondary index (GitHub-only wheels, e.g. sqlite-vec).
-# The PyTorch CPU index is listed FIRST among the extra indexes so that
-# pip resolves ``torch==2.6.0+cpu`` from it before the Aliyun mirror can
-# offer a CUDA build (the Aliyun mirror ships torch WITHOUT the ``+cpu``
-# local-version marker, i.e. the 6GB CUDA wheel — installing that triggers
-# WinError 1114 on machines lacking the new VC++ Runtime and makes the
-# install ~30x slower). Install with:  pip install -r requirements.txt
+# Install with:  pip install -r requirements.txt
+#
+# NOTE: torch and transformers are intentionally NOT listed. The
+# cross-encoder reranker runs on onnxruntime via fastembed (the same
+# runtime the bge embedding model uses), so torch's ~200MB CPU build
+# (and the Windows c10.dll / WinError 1114 load failures it triggered)
+# is eliminated entirely.
 # =====================================================================
 
 --index-url https://mirrors.aliyun.com/pypi/simple/
---extra-index-url https://download.pytorch.org/whl/cpu
 --extra-index-url https://pypi.org/simple/
 
 
@@ -36,21 +36,15 @@ llama-index-core>=0.11.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 
-# --- Local embedding (bge-small-en-v1.5 on CPU via ONNX) ---
-fastembed>=0.3.0
+# --- Local embedding + cross-encoder reranker (both ONNX via fastembed) ---
+# fastembed serves BOTH the bge-small-en-v1.5 embedding model AND the
+# ms-marco-MiniLM-L-6-v2 cross-encoder reranker. TextCrossEncoder (the
+# reranker API) is stable from 0.7+, so pin the floor there.
+fastembed>=0.7.0
 
-# --- Local cross-encoder reranker (MiniLM, CPU) ---
-transformers>=4.44.0
-# torch: pin to the CPU-only build. The default (CUDA) build from the Aliyun
-# mirror is ~6GB and depends on a new VC++ Runtime (vcruntime140_1.dll) that is
-# absent on many Windows machines, causing WinError 1114 DLL load failures. The
-# CPU build (~200MB) has no such dependency and is all a small CPU reranker
-# needs. The "+cpu" local-version marker forces pip to pick THIS wheel, not the
-# CUDA one; the PyTorch CPU index is declared at the top of this file so pip
-# can actually find the +cpu wheel.
-torch==2.6.0+cpu
-# onnxruntime: pin to a version whose Windows DLLs don't require the new VC++
-# Runtime. fastembed's constraint is Python-version-dependent:
+# onnxruntime: shared by the embedding and reranker models. Pin to a version
+# whose Windows DLLs don't require the new VC++ Runtime. fastembed's constraint
+# is Python-version-dependent:
 #   py3.10-3.12 -> >=1.17.0, !=1.20.0   (1.20.1 is allowed and stable)
 #   py3.13+     -> >1.21.0              (must use a newer build)
 # 1.27.0 (what fastembed 0.8.0 pulls on py3.13) triggers the same VC++ DLL
