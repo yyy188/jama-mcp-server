@@ -52,3 +52,11 @@ probe/
 lyra_*.log
 lyra_*.json
 *_sync_metrics.json
+
+# ====== Self-test / transport test logs ======
+selftest_*.log
+http_test.log
+sse_test.log
+
+# ====== uv virtualenv (created by `uv sync`) ======
+.venv/

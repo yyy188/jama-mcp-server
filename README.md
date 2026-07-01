@@ -102,49 +102,98 @@ user-initiated one.
 
 ## Setup
 
+### Recommended: `uv` (deterministic, reproducible)
+
+[`uv`](https://docs.astral.sh/uv/) is a single-binary Python package manager
+(~20 MB). Its lockfile (`uv.lock`) pins the *entire* dependency tree — every
+package and its transitive deps — so `uv sync` on a new machine produces the
+exact same environment, with no version-resolution surprises.
+
 ```bash
-# 1. Install dependencies (Aliyun mirror for speed; no torch needed — the
-#    reranker runs on onnxruntime via fastembed, the same runtime the bge
-#    embedding model uses).
+# 1. Install uv (one-time, ~20 MB single binary)
+#    Windows:  winget install astral-sh.uv
+#    macOS/Linux:  curl -LsSf https://astral.sh/uv/install.sh | sh
+#    (or: pip install uv)
+
+# 2. Sync dependencies from the lockfile (creates .venv, installs 116 packages)
+uv sync
+
+# 3. Configure
+cp .env.example .env        # then edit: fill in JAMA_URL / JAMA_CLIENT_ID / JAMA_CLIENT_SECRET
+
+# 4. Pre-download models (~150 MB ONNX, one-time)
+uv run python bootstrap.py
+
+# 5. Run
+uv run python server.py     # stdio (default) — local MCP client spawns it
+```
+
+### Alternative: `pip`
+
+```bash
 pip install -r requirements.txt
-
-# 2. Configure + pre-download models (the wizard writes .env, validates deps +
-#    config, probes connectivity with --self-test, AND downloads the embedding +
-#    reranker models so the first sync isn't slow). Use --skip-models to defer.
-python setup_wizard.py --self-test
-
-# 3. Run (stdio transport for an MCP client)
+cp .env.example .env        # fill in Jama credentials
+python bootstrap.py
 python server.py
 ```
+
+### Transports: stdio vs HTTP
+
+The server supports three transports, selected by `JAMA_MCP_TRANSPORT`:
+
+| Transport | Use case | Client connects via |
+|-----------|----------|---------------------|
+| `stdio` (default) | Local MCP client (Claude Desktop) spawns server as subprocess | stdin/stdout |
+| `streamable-http` | Remote client / Docker / shared server | `http://host:8000/mcp` |
+| `sse` | Older MCP clients that only support SSE | `http://host:8000/sse` |
+
+For HTTP/SSE mode, set `JAMA_MCP_HOST` (`0.0.0.0` for remote access) and
+`JAMA_MCP_PORT` (default `8000`):
+
+```bash
+# streamable-http (MCP new standard), listening on all interfaces
+JAMA_MCP_TRANSPORT=streamable-http JAMA_MCP_HOST=0.0.0.0 uv run python server.py
+# SSE (older clients)
+JAMA_MCP_TRANSPORT=sse JAMA_MCP_HOST=0.0.0.0 uv run python server.py
+```
+
+#### MCP client config (stdio, Claude Desktop example)
+
+```json
+{
+  "mcpServers": {
+    "jama-mcp": {
+      "command": "uv",
+      "args": ["run", "--directory", "/abs/path/to/jama", "python", "server.py"]
+    }
+  }
+}
+```
+
+#### MCP client config (streamable-http)
+
+Point your MCP client at `http://localhost:8000/mcp` (or the remote host:port).
 
 To (re)download just the models later without re-running the wizard:
 
 ```bash
-python bootstrap.py
+uv run python bootstrap.py     # or: python bootstrap.py
 ```
 
-The models live in `user/huggingface/` (project-local, ~210MB total: a ~130MB
-ONNX embedding + ~80MB ONNX cross-encoder reranker). Both run on onnxruntime
-via fastembed — **no torch/transformers dependency**, so the Windows
-`c10.dll`/WinError 1114 load failure that torch triggers is eliminated. The
-model files are plain data — portable across machines, so you can also copy
-that folder from another machine to skip the download entirely.
+The models live in `user/huggingface/` (project-local, ~150 MB: a ~130 MB
+ONNX embedding + ~80 MB ONNX cross-encoder reranker). Both run on onnxruntime
+via fastembed — CPU-only, no torch/transformers. The model files are plain
+data — portable across machines, so you can copy that folder from another
+machine to skip the download entirely.
 
 ### Why pinned onnxruntime versions
 
-`requirements.txt` pins **`onnxruntime==1.20.1`** (or `1.21.1` on Python
-3.13+) on purpose:
-
-- `onnxruntime` 1.27.0 (what `fastembed` pulls on Python 3.13+) depends on the
-  new VC++ Runtime (`vcruntime140_1.dll`) absent on many Windows machines,
-  causing `WinError 1114` DLL load failures. 1.20.1 satisfies `fastembed`'s
-  constraint on Python 3.10–3.12 (`>=1.17.0, !=1.20.0`) and loads cleanly;
-  Python 3.13+ needs `>1.21`, so it's pinned to 1.21.1 there.
-- Both the embedding and the reranker share this single runtime, so the pin
-  protects the whole ML stack at once.
-
-If you upgrade these, re-test on a clean Windows machine **without** the latest
-VC++ Redistributable installed.
+`onnxruntime` is pinned to **`1.20.1`** (or `1.21.1` on Python 3.13+) on
+purpose: 1.27.0 (what `fastembed` pulls on Python 3.13+) depends on the new
+VC++ Runtime absent on many Windows machines, causing `WinError 1114` DLL load
+failures. The pin protects the whole ML stack (embedding + reranker share this
+single runtime). If you upgrade it, re-test on a clean Windows machine without
+the latest VC++ Redistributable.
 
 After the server starts, the LLM client should call `bootstrap_models` (and poll
 `get_bootstrap_progress` every ~2 min) to pre-download the embedding + reranker

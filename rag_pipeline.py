@@ -254,6 +254,11 @@ class EmbeddingClient:
 # embedded raw; only queries get the prefix.
 _BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
+# CPU-only policy: fastembed's TextEmbedding / TextCrossEncoder default
+# ``cuda`` to ``Device.AUTO`` (which would use a GPU if present). We ALWAYS pass
+# ``cuda=False`` to force the onnxruntime CPU backend — this server is
+# CPU-only by design, so every fastembed construction below hardcodes it.
+
 
 class LocalEmbeddingClient:
     """CPU-only local embedding via fastembed (bge-small-en-v1.5, ONNX).

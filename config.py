@@ -367,6 +367,8 @@ _ENV_KEYS = [
     "SYNC_DOWNLOAD_CONCURRENCY",
     # --- Chunking ---
     "CHUNK_SIZE", "CHUNK_OVERLAP",
+    # --- MCP transport ---
+    "JAMA_MCP_TRANSPORT", "JAMA_MCP_HOST", "JAMA_MCP_PORT",
 ]
 
 # Comment headers inserted before each logical group in the written .env, so the
@@ -379,6 +381,7 @@ _ENV_HEADERS: dict[str, str] = {
     "JAMA_MCP_DB_PATH": "Storage",
     "SYNC_ENABLED": "Incremental sync",
     "CHUNK_SIZE": "Chunking",
+    "JAMA_MCP_TRANSPORT": "MCP transport",
 }
 
 

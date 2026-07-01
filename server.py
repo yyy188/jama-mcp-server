@@ -1,6 +1,16 @@
 """Jama MCP Server entry point.
 
-Exposes MCP tools to LLM clients (Model Context Protocol, stdio transport):
+Exposes MCP tools to LLM clients over three transports (selectable via the
+JAMA_MCP_TRANSPORT env var):
+  * stdio (default)     — local MCP client spawns this as a subprocess.
+  * streamable-http     — server listens on a port; remote clients connect via
+                          http://host:8000/mcp (the MCP new standard).
+  * sse                 — server-sent events transport for older MCP clients
+                          (http://host:8000/sse).
+For HTTP/SSE modes set JAMA_MCP_HOST (0.0.0.0 for remote access) and
+JAMA_MCP_PORT (default 8000).
+
+Tools exposed:
   * bootstrap_models        - async pre-download of embedding + reranker models
   * init_jama_project        - async background init (returns job_id)
   * reinit_jama_project      - async full re-sync of an initialized project
@@ -16,8 +26,10 @@ run as async background jobs in a thread pool and report progress into the
 syncs initialized projects every N hours: it walks items whose modifiedDate >
 last_sync_time, cleans them, re-chunks and updates the FTS5 + sqlite-vec indexes.
 
-Run with:  python server.py
-Configure an MCP client (Claude Desktop, etc.) to launch this as a stdio server.
+Run with:  python server.py            (stdio, default)
+           JAMA_MCP_TRANSPORT=streamable-http python server.py   (HTTP)
+Configure an MCP client (Claude Desktop, etc.) to launch this as a stdio server,
+or connect remotely in HTTP/SSE mode.
 """
 from __future__ import annotations
 
@@ -1758,8 +1770,25 @@ def main() -> None:
     _resume_interrupted_syncs()
     _start_scheduler()
     _warn_if_models_missing()
-    log.info("Jama MCP Server starting (stdio)...")
-    mcp.run(transport="stdio")
+    # Transport selection. stdio (default) is for local MCP clients that spawn
+    # the server as a subprocess. streamable-http / sse expose the server over
+    # HTTP so remote clients (or a Docker container) can connect by URL.
+    # FASTMCP_HOST/FASTMCP_PORT env vars do NOT work (FastMCP's constructor
+    # kwargs override them), so we set mcp.settings.host/port directly before
+    # run() — the Settings pydantic model is mutable.
+    transport = os.environ.get("JAMA_MCP_TRANSPORT", "stdio")
+    if transport in ("sse", "streamable-http"):
+        mcp.settings.host = os.environ.get("JAMA_MCP_HOST", "127.0.0.1")
+        try:
+            mcp.settings.port = int(os.environ.get("JAMA_MCP_PORT", "8000"))
+        except ValueError:
+            mcp.settings.port = 8000
+    elif transport not in ("stdio",):
+        log.warning("Unknown JAMA_MCP_TRANSPORT=%r; falling back to stdio",
+                    transport)
+        transport = "stdio"
+    log.info("Jama MCP Server starting (%s)...", transport)
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":
