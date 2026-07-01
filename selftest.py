@@ -333,7 +333,15 @@ def test_concurrent_sync(jama, project_id: int) -> None:
     with write_txn(conn):
         conn.execute("DELETE FROM chunks WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM chunks_fts WHERE project_id=?", (project_id,))
-        conn.execute("DELETE FROM chunks_vec")
+        # Delete only THIS project's vectors. chunks_vec has no project_id
+        # column, so JOIN to chunks to scope the delete — an unconditional
+        # DELETE FROM chunks_vec would wipe ALL projects' vectors (a bug that
+        # silently destroyed Lyra's 8664-vector index every time selftest ran
+        # on the small test project 20186).
+        conn.execute(
+            "DELETE FROM chunks_vec WHERE chunk_id IN "
+            "(SELECT chunk_id FROM chunks WHERE project_id=?)",
+            (project_id,))
         conn.execute("DELETE FROM items WHERE project_id=?", (project_id,))
     import uuid as _uuid
     job_id = f"selftest-sync-{_uuid.uuid4().hex[:8]}"
@@ -380,7 +388,13 @@ def test_crash_recovery(project_id: int) -> None:
     with write_txn(conn):
         conn.execute("DELETE FROM chunks WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM chunks_fts WHERE project_id=?", (project_id,))
-        conn.execute("DELETE FROM chunks_vec")
+        # Delete only THIS project's vectors (not ALL projects' — see
+        # test_concurrent_sync for the same scoped-delete pattern).
+        conn.execute(
+            "DELETE FROM chunks_vec WHERE chunk_id IN "
+            "(SELECT chunk_id FROM chunks WHERE project_id=?)",
+            (project_id,))
+        conn.execute("DELETE FROM items WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM items WHERE project_id=?", (project_id,))
     before = get_project(conn, project_id)
     _tlog(f"crash recovery: project {project_id} left INITIALIZING; "
