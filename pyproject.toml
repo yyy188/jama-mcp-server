@@ -46,11 +46,22 @@ dependencies = [
 ]
 
 [tool.uv]
-# Aliyun mirror primary (China mainland acceleration); PyPI secondary (for
-# packages the Aliyun mirror may lack, e.g. sqlite-vec GitHub-only wheels).
-# Both are consulted; uv picks the best-matching wheel across indexes.
+# China mirror strategy: Tsinghua (TUNA) is the primary index (default=true);
+# Tencent Cloud is the fallback. `first-index` forces uv to try the primary
+# first and only fall back to the secondary when a package is missing there —
+# this avoids uv querying both indexes in parallel (which causes timeouts when
+# the secondary — here Tencent — is slow, even though the primary succeeded).
+#
+# PyPI (pypi.org) is intentionally NOT listed: from mainland China it is often
+# unreachable and its inclusion caused `uv sync` to hang ~9min then fail with a
+# download timeout. Both Tsinghua and Tencent mirror PyPI fully, so every
+# package (including sqlite-vec's GitHub-only wheels, which both mirrors
+# proxy) is available without hitting pypi.org directly.
+index-strategy = "first-index"
+
 [[tool.uv.index]]
-url = "https://mirrors.aliyun.com/pypi/simple/"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
 default = true
+
 [[tool.uv.index]]
-url = "https://pypi.org/simple/"
+url = "https://mirrors.cloud.tencent.com/pypi/simple/"
