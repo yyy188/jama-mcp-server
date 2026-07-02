@@ -81,3 +81,6 @@ init_lyra*.log
 
 # ====== uv virtualenv (created by `uv sync`) ======
 .venv/
+
+# ====== WorkBuddy agent workspace data (project-local) ======
+.workbuddy/

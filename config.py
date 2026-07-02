@@ -189,7 +189,21 @@ class RerankerSettings:
     candidates. A cross-encoder scores (query, document) pairs directly via a
     sequence-classification head — no causal-LM prompt format, no large logits
     tensor.
+
+    **Disabled by default** (``enabled=False``). Benchmarking on the Lyra
+    corpus showed the MiniLM reranker actively HURT precision: it pushed
+    authoritative Feature items out of the top-k in favour of near-duplicate
+    Test Cases whose names mirror the query. Pure RRF ordering scored
+    Recall@50 = 73.3% vs rerank Recall@5 = 33.3%. The default search path
+    (``RAGPipeline.search``) is therefore RRF-only. Set
+    ``RERANKER_ENABLED=1`` to re-enable the download/load/rerank path for
+    experimentation with a better model.
     """
+    # Master switch. When False (default) the reranker is NOT downloaded, NOT
+    # loaded and NOT called — search uses pure RRF ordering. Sync pre-download,
+    # bootstrap and the startup model hint all skip the reranker when this is
+    # off, so a default install never fetches the ~80MB ONNX weights.
+    enabled: bool = _get("RERANKER_ENABLED", "0") == "1"
     model_name: str = _get("RERANKER_MODEL",
                            "cross-encoder/ms-marco-MiniLM-L-6-v2")
     # If model loading fails, degrade to RRF-only scoring instead of crashing.
@@ -368,7 +382,7 @@ _ENV_KEYS = [
     "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
     "EMBEDDING_DIMENSIONS", "EMBEDDING_KEY_HEADER",
     # --- Local cross-encoder reranker (CPU, ONNX via fastembed) ---
-    "RERANKER_MODEL", "RERANKER_ALLOW_FALLBACK",
+    "RERANKER_ENABLED", "RERANKER_MODEL", "RERANKER_ALLOW_FALLBACK",
     # --- Storage ---
     "JAMA_MCP_DB_PATH", "SQLITE_BUSY_TIMEOUT_MS",
     # --- Incremental sync ---

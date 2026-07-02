@@ -11,12 +11,12 @@ For HTTP/SSE modes set JAMA_MCP_HOST (0.0.0.0 for remote access) and
 JAMA_MCP_PORT (default 8000).
 
 Tools exposed:
-  * bootstrap_models        - async pre-download of embedding + reranker models
+  * bootstrap_models        - async pre-download of embedding model (reranker optional)
   * init_jama_project        - async background init (returns job_id)
   * reinit_jama_project      - async full re-sync of an initialized project
   * get_sync_progress / get_bootstrap_progress - poll job progress
   * get_sync_status          - project monitor: in-flight + last run of each kind
-  * search_jama_semantics    - high-precision RAG (client multi-query + hybrid + RRF + rerank)
+  * search_jama_semantics    - high-precision RAG (client multi-query + hybrid + RRF)
   * query_jama_native_metadata - direct Jama REST filtering (exact metadata)
   * plus read-only Jama browse tools (items, relationships, releases, ...)
 
@@ -100,14 +100,14 @@ def _project_lock(project_id: int) -> threading.Lock:
 # This is the canonical MCP way to steer tool selection: it tells the model
 # to DEFAULT to fusion retrieval and only fall back to native metadata for
 # precise pointers, so fuzzy/keyword/natural-language questions always hit
-# the hybrid (FTS5 BM25 + sqlite-vec + RRF + rerank) path.
+# the hybrid (FTS5 BM25 + sqlite-vec + RRF) path.
 JAMA_MCP_INSTRUCTIONS = """\
 Jama MCP — tool selection guide (read before choosing a tool)
 
 DEFAULT TO FUSION SEARCH. For any question that is not a precise lookup,
-call `search_jama_semantics`. It already fuses three retrieval signals in
-one call — keyword (FTS5/BM25), vector (sqlite-vec cosine) and RRF — then
-reranks with a local cross-encoder model. So "like", "keyword" and "semantic"
+call `search_jama_semantics`. It fuses three retrieval signals in one call
+— keyword (FTS5/BM25), vector (sqlite-vec cosine) and RRF (Reciprocal Rank
+Fusion, with item-level dedup). So "like", "keyword" and "semantic"
 queries are ALL best answered by this single tool. Use it for:
   • natural-language questions      ("how does volume sync work")
   • partial / fuzzy matches         ("something about login timeout")
@@ -136,24 +136,31 @@ QUERY EXPANSION: before calling `search_jama_semantics`, rewrite the
 user's query into 3-5 diverse sub-queries (different semantic angles —
 synonyms, broader/narrower scope, related concepts) and pass them via
 the `sub_queries` parameter; keep the original query in `query` (it is
-the rerank reference). This maximizes recall for RRF fusion and is
-preferred over letting the server fall back to lexical variants.
+the primary recall reference). This maximizes recall for RRF fusion and
+is preferred over letting the server fall back to lexical variants.
 
-MODEL BOOTSTRAP (first-run, before any init). The embedding model (~130MB
-ONNX) and cross-encoder reranker (~80MB ONNX) are NOT bundled — they download
-on first use. Both run on onnxruntime via fastembed (no torch dependency).
-Call `bootstrap_models()` right after the server is configured: it downloads
-BOTH models asynchronously and returns a job_id immediately, so the first
-sync isn't slowed by a download and a download failure surfaces here instead
-of mid-sync. Poll `get_bootstrap_progress(job_id)` roughly every 2 minutes,
-reporting each sample (status, progress %, message) to the user, until status
-is DONE or ERROR. Progress is phase-based (not live bytes): fastembed (used
-for both models) lacks per-chunk byte callbacks, so `message` reports phase
-transitions (e.g. "Downloading reranker model (...)" -> "Reranker model
-ready") rather than byte counts. Already-cached models are skipped, so
-re-running bootstrap after success is a fast no-op. OPTIONAL: if skipped,
-init/sync still works (downloads on demand) but the first sync is slower and
-a download failure surfaces mid-sync — prefer running bootstrap first.
+MODEL BOOTSTRAP (first-run, before any init). The embedding model
+(~130MB ONNX) is NOT bundled — it downloads on first use and runs on
+onnxruntime via fastembed (no torch dependency). Call
+`bootstrap_models()` right after the server is configured: it downloads
+the embedding model asynchronously and returns a job_id immediately, so
+the first sync isn't slowed by a download and a download failure
+surfaces here instead of mid-sync. Poll `get_bootstrap_progress(job_id)`
+roughly every 2 minutes, reporting each sample (status, progress %,
+message) to the user, until status is DONE or ERROR. Progress is
+phase-based (not live bytes): fastembed lacks per-chunk byte callbacks,
+so `message` reports phase transitions rather than byte counts.
+Already-cached models are skipped, so re-running bootstrap after success
+is a fast no-op. OPTIONAL: if skipped, init/sync still works (downloads
+on demand) but the first sync is slower and a download failure surfaces
+mid-sync — prefer running bootstrap first.
+
+  NOTE: the cross-encoder reranker is DISABLED by default
+  (RERANKER_ENABLED=0). Benchmarking on the Lyra corpus showed pure RRF
+  ordering outperforms rerank (Recall@50 73.3% vs Recall@5 33.3%), so the
+  default search path needs NO reranker weights and bootstrap skips the
+  ~80MB download. Set RERANKER_ENABLED=1 to re-enable the reranker for
+  experimentation (bootstrap then also downloads its weights).
 
 SYNC MONITORING. `init_jama_project` (first init) and `reinit_jama_project`
 (re-index an already-initialized project) run in the BACKGROUND and return a
@@ -298,24 +305,33 @@ def _sync_project_locked(project_id: int, *, job_id: str | None,
     upsert_project(conn, project_id, status="INITIALIZING")
 
     # ---- Step 1: pre-download ML models BEFORE any indexing work. ----
-    # Both the embedding model (~130MB ONNX) and the reranker (~80MB MiniLM)
-    # are fetched first so that (a) a download failure surfaces immediately
-    # with a clear message instead of mid-sync, and (b) the first search
-    # after sync doesn't stall on a model download. Non-fatal: failures just
-    # defer to lazy load (embedding) or RRF fallback (reranker) — sync still
-    # proceeds.
+    # The embedding model (~130MB ONNX) is fetched first so that (a) a download
+    # failure surfaces immediately with a clear message instead of mid-sync,
+    # and (b) the first search after sync doesn't stall on a model download.
+    # Non-fatal: failures just defer to lazy load — sync still proceeds.
+    # The cross-encoder reranker is only pre-downloaded when explicitly enabled
+    # (RERANKER_ENABLED=1); the default search path is pure RRF and needs no
+    # reranker weights, so a default install never fetches the ~80MB ONNX.
     if job_id:
-        update_job(conn, job_id, status="RUNNING", progress=0.0,
-                   message="Downloading embedding + reranker models")
+        if settings.reranker.enabled:
+            update_job(conn, job_id, status="RUNNING", progress=0.0,
+                       message="Downloading embedding + reranker models")
+        else:
+            update_job(conn, job_id, status="RUNNING", progress=0.0,
+                       message="Downloading embedding model (reranker disabled)")
     pipeline = rag()
     try:
         pipeline.embedder.ensure_downloaded()
     except Exception as exc:
         log.warning("Embedding model pre-download skipped: %s", exc)
-    try:
-        pipeline.reranker.ensure_downloaded()
-    except Exception as exc:
-        log.warning("Reranker pre-download skipped: %s", exc)
+    if settings.reranker.enabled:
+        try:
+            pipeline.reranker.ensure_downloaded()
+        except Exception as exc:
+            log.warning("Reranker pre-download skipped: %s", exc)
+    else:
+        log.info("Reranker disabled (RERANKER_ENABLED=0); skipping pre-download. "
+                 "Search uses pure RRF ordering.")
 
     # ---- Step 2: Jama network pre-flight (with transient-failure retry). ----
     # The speed test measures live throughput; a momentary network blip can
@@ -618,36 +634,49 @@ def _run_bootstrap_job(job_id: str) -> None:
         _set(0.45, f"Embedding provider is {provider} (no model to download)")
 
     # --- Phase 2: reranker model (ONNX via fastembed, no byte-level progress) --
-    # fastembed (used by ensure_downloaded) gives no per-chunk callback, so we
-    # can't show live bytes — only phase transitions. The progress band
-    # 0.5..0.95 is held at 0.5 while downloading, then jumps to 0.95 on success.
-    _set(0.5, f"Downloading reranker model ({settings.reranker.model_name}, ~80MB ONNX)")
+    # Only runs when the reranker is explicitly enabled (RERANKER_ENABLED=1).
+    # The default search path is pure RRF, so the ~80MB reranker weights are
+    # not needed — skipping this phase keeps a default install lean and the
+    # bootstrap job fast (embedding-only).
+    if not settings.reranker.enabled:
+        _set(0.95, "Reranker disabled (RERANKER_ENABLED=0); skipping download. "
+                   "Search uses pure RRF ordering.")
+    else:
+        # fastembed (used by ensure_downloaded) gives no per-chunk callback, so
+        # we can't show live bytes — only phase transitions. The progress band
+        # 0.5..0.95 is held at 0.5 while downloading, then jumps to 0.95 on
+        # success.
+        _set(0.5, f"Downloading reranker model ({settings.reranker.model_name}, ~80MB ONNX)")
 
-    def _reranker_cb(received: int, expected: int | None) -> None:
-        # Called once at completion by _ensure_weights_downloaded (snapshot_download
-        # has no byte callback). Advance to 0.95 so the monitor sees movement.
-        _set(0.95, "Reranker model downloaded")
+        def _reranker_cb(received: int, expected: int | None) -> None:
+            # Called once at completion by _ensure_weights_downloaded (snapshot_download
+            # has no byte callback). Advance to 0.95 so the monitor sees movement.
+            _set(0.95, "Reranker model downloaded")
 
-    try:
-        rr = pipeline.reranker
-        if rr._model is not None or rr._load_error is not None:  # type: ignore[attr-defined]
-            _set(0.95, "Reranker already available/failed-skip")
-        else:
-            rr.ensure_downloaded(progress_callback=_reranker_cb)
-            _set(0.95, "Reranker model ready")
-    except Exception as exc:
-        msg = f"Reranker model download failed: {exc}"
-        log.error("Bootstrap %s: %s", job_id, msg)
-        errors.append(msg)
+        try:
+            rr = pipeline.reranker
+            if rr._model is not None or rr._load_error is not None:  # type: ignore[attr-defined]
+                _set(0.95, "Reranker already available/failed-skip")
+            else:
+                rr.ensure_downloaded(progress_callback=_reranker_cb)
+                _set(0.95, "Reranker model ready")
+        except Exception as exc:
+            msg = f"Reranker model download failed: {exc}"
+            log.error("Bootstrap %s: %s", job_id, msg)
+            errors.append(msg)
 
     # --- Terminal state ------------------------------------------------------
     if errors:
         update_job(conn, job_id, status="ERROR", progress=0.95,
                    message="Bootstrap failed: " + "; ".join(errors)[:400])
-    else:
+    elif settings.reranker.enabled:
         update_job(conn, job_id, status="DONE", progress=1.0,
                    message="Models ready: embedding + reranker cached locally")
-    log.info("Bootstrap job %s complete (errors=%d)", job_id, len(errors))
+    else:
+        update_job(conn, job_id, status="DONE", progress=1.0,
+                   message="Embedding model ready (reranker disabled; RRF-only)")
+    log.info("Bootstrap job %s complete (errors=%d, reranker=%s)",
+             job_id, len(errors), "enabled" if settings.reranker.enabled else "disabled")
 
 
 # --------------------------------------------------------------------------- #
@@ -836,17 +865,22 @@ _bootstrap_job_id: str | None = None
 
 @mcp.tool()
 def bootstrap_models() -> dict:
-    """Pre-download the embedding + reranker models so syncs never wait on them.
+    """Pre-download the embedding model (and optionally the reranker) so syncs never wait on them.
 
-    Downloads the local embedding model (bge-small-en-v1.5, ~130MB ONNX) and the
-    cross-encoder reranker (ms-marco-MiniLM-L-6-v2, ~80MB ONNX) into the
-    project-local cache, ASYNCHRONOUSLY. Both run on onnxruntime via fastembed
-    — no torch/transformers dependency. Returns a job_id immediately. This is
-    the recommended first step after installing/configuring the server — call
-    it BEFORE init_jama_project so the first sync isn't slowed by model
-    downloads. Models already cached are skipped. Poll progress with
+    Downloads the local embedding model (bge-small-en-v1.5, ~130MB ONNX) into
+    the project-local cache, ASYNCHRONOUSLY, via onnxruntime/fastembed (no
+    torch/transformers dependency). Returns a job_id immediately. This is the
+    recommended first step after installing/configuring the server — call it
+    BEFORE init_jama_project so the first sync isn't slowed by a model
+    download. Models already cached are skipped. Poll progress with
     get_bootstrap_progress roughly every 2 minutes, reporting each sample to
     the user, until status is DONE or ERROR.
+
+    The cross-encoder reranker (ms-marco-MiniLM-L-6-v2, ~80MB ONNX) is only
+    downloaded when explicitly enabled via RERANKER_ENABLED=1. The default
+    search path is pure RRF ordering (benchmarking showed it outperforms
+    rerank), so a default install needs NO reranker weights and bootstrap
+    completes after the embedding model alone.
 
     Returns:
         {"job_id": "...", "status": "RUNNING"} or, if a bootstrap is already
@@ -892,11 +926,11 @@ def get_bootstrap_progress(job_id: str) -> dict:
 
     After calling bootstrap_models, poll this roughly every 2 minutes, reporting
     each sample (status, progress %, message) to the user, until status is DONE
-    or ERROR. Progress is phase-based, not live bytes: both the embedding
-    (~130MB ONNX, via fastembed) and the reranker (~80MB ONNX, via fastembed)
-    lack per-chunk byte callbacks, so `message` reports phase transitions (e.g.
-    "Downloading reranker model (...)" -> "Reranker model ready") rather than
-    byte counts.
+    or ERROR. Progress is phase-based, not live bytes: the embedding
+    (~130MB ONNX, via fastembed) lacks per-chunk byte callbacks, so `message`
+    reports phase transitions rather than byte counts. When the reranker is
+    enabled (RERANKER_ENABLED=1) a second phase downloads the ~80MB reranker;
+    otherwise bootstrap completes after the embedding model alone.
 
     Returns:
         {"job_id","project_id","kind","status","progress","total","done",
@@ -1037,26 +1071,30 @@ def get_sync_status(project_id: str) -> dict:
 @mcp.tool()
 def search_jama_semantics(project_id: str, query: str,
                           sub_queries: list[str] = None,
-                          item_type: str = None, top_k: int = 5,
+                          item_type: str = None, top_k: int = 50,
                           candidate_k: int = 100,
                           modified_after: str = None,
                           modified_before: str = None) -> dict:
     """Semantic search over an initialized Jama project using high-precision RAG.
 
     This is the DEFAULT tool for any non-precise question. It fuses keyword
-    (FTS5/BM25), vector (sqlite-vec cosine) and RRF in one call, then reranks
-    with a local cross-encoder model (ONNX via fastembed/onnxruntime) — so "like",
+    (FTS5/BM25), vector (sqlite-vec cosine) and RRF in one call — so "like",
     "keyword" and "semantic" queries are all best answered here. Prefer it over
     native metadata unless the user gives an exact document key / status / item id.
 
     Pipeline: client Multi-Query expansion -> hybrid recall (sqlite-vec +
-    FTS5) -> RRF fusion -> local cross-encoder reranker -> top_k results.
+    FTS5) -> RRF fusion (with item-level dedup) -> top_k results. Ranking is
+    pure RRF by default: the cross-encoder reranker is DISABLED
+    (``RERANKER_ENABLED=0``) because benchmarking on the Lyra corpus showed it
+    HURT precision (Recall@50 73.3% RRF-only vs Recall@5 33.3% with rerank).
+    The reranker code path remains available for re-enablement.
 
     Args:
         project_id: numeric string Jama project id (must be initialized first).
         query: the ORIGINAL natural-language search query, verbatim. It is
-               always the rerank reference, so even when `sub_queries` is
-               supplied you MUST pass the original user query here too.
+               always kept as the primary recall/rerank reference, so even
+               when `sub_queries` is supplied you MUST pass the original user
+               query here too.
         sub_queries: RECOMMENDED. Rewrite `query` into 3-5 diverse search
                      sub-queries capturing different semantic angles
                      (synonyms, broader/narrower scope, related concepts) to
@@ -1070,12 +1108,15 @@ def search_jama_semantics(project_id: str, query: str,
                         "user inactivity logout"]
         item_type: optional Jama item-type id to filter (e.g. "89011" for Test
                    Cases, "89009" for Requirements). Pass None for all.
-        top_k: final results to return (default 5).
-        candidate_k: candidate pool size before reranking (default 100). A
-                     larger pool improves recall (vector+FTS recall is capped
-                     by this): measured vecR@25=7%, @50=13%, @100=21%, @200=34%.
-                     The MiniLM reranker scores 100 candidates in ~1.5s on CPU.
-                     Range 1-500; must be >= top_k.
+        top_k: final results to return (default 50). The BEIR sweep showed
+               top_k=50 + candidate_k=100 is the optimal combination (highest
+               Recall@50 = 73.3%). Range 1-50; must be <= candidate_k.
+        candidate_k: candidate pool size after RRF fusion + item dedup
+                     (default 100). A larger pool improves recall (vector+FTS
+                     recall is capped by this): measured vecR@25=7%, @50=13%,
+                     @100=21%, @200=34%. Note: candidate_k=200 DILUTES RRF
+                     rankings and actually lowers Recall@50 to 64.4%, so 100
+                     is the measured sweet spot. Range 1-500; must be >= top_k.
         modified_after: optional ISO-8601 lower bound on item modified date
                         (inclusive). Naive timestamps are assumed UTC.
                         e.g. "2024-01-01" or "2024-06-01T00:00:00Z".
@@ -1865,8 +1906,11 @@ def _warn_if_models_missing() -> None:
         if settings.embedding.provider == "local":
             if not pipeline.embedder._model_present():  # type: ignore[attr-defined]
                 missing.append("embedding (bge-small-en-v1.5)")
-        # Reranker: lightweight on-disk check (no load, no network).
-        if not pipeline.reranker.weights_cached():
+        # Reranker: lightweight on-disk check (no load, no network). Only
+        # probed when the reranker is enabled — the default RRF-only search
+        # path needs no reranker weights, so we never nag about a missing
+        # model the user explicitly opted out of.
+        if settings.reranker.enabled and not pipeline.reranker.weights_cached():
             missing.append(f"reranker ({settings.reranker.model_name})")
     except Exception:
         return  # don't let a probe failure noise up startup
