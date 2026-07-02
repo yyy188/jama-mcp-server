@@ -397,7 +397,8 @@ def vector_search(conn: sqlite3.Connection, query_vec: list[float],
     # filter to this project. A large project (5000+ items) needs a generous
     # k so enough same-project candidates survive. k = limit * 8 handles
     # projects up to ~40k items (8x over-fetch).
-    k = max(limit * 8, 200)
+    # sqlite-vec caps KNN k at 4096; clamp to avoid the OperationalError.
+    k = min(max(limit * 8, 200), 4000)
 
     q = """
         SELECT c.chunk_id, c.item_id, c.project_id, c.item_type,

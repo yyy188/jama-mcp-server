@@ -581,15 +581,15 @@ class MultiQueryExpander:
         return self._lexical_expand(query)
 
     def _lexical_expand(self, query: str) -> list[str]:
-        """Deterministic variants: original + keyword-focused + broadened."""
+        """Deterministic variants: original + keyword-focused + broadened.
+
+        Uses the module-level ``_FTS_STOPWORDS`` set (shared with
+        ``_to_fts_query``) so the two recall paths agree on what a stopword is.
+        """
         subs = [query]
         # Keep only alphanumeric tokens (drop common stopwords).
-        stop = {"the", "a", "an", "of", "to", "in", "on", "for", "and", "or",
-                "is", "are", "be", "with", "that", "this", "it", "as", "by",
-                "how", "does", "do", "what", "which", "why", "when", "can",
-                "will", "should", "would", "could", "i", "we", "you"}
         tokens = [t for t in re.findall(r"[A-Za-z0-9_-]+", query)
-                  if t.lower() not in stop]
+                  if t.lower() not in _FTS_STOPWORDS]
         if tokens:
             # keyword-focused (non-stopword tokens only)
             kw = " ".join(tokens)
@@ -598,6 +598,14 @@ class MultiQueryExpander:
             # broadened / truncated to first few meaningful tokens
             if len(tokens) > 4:
                 subs.append(" ".join(tokens[:4]))
+            # concept variant: the single most informative token (longest
+            # non-stopword) — gives RRF a recall angle focused on the core
+            # concept, which helps when the full keyword phrase over-constrains
+            # vector recall (e.g. "volume sync" -> "synchronization" alone).
+            if len(tokens) > 1:
+                concept = max(tokens, key=len)
+                if concept.lower() not in {s.lower() for s in subs}:
+                    subs.append(concept)
         # Deduplicate while preserving order; always keep the original first.
         seen, out = set(), []
         for s in subs:
@@ -632,6 +640,12 @@ def rrf_fuse(ranked_lists: list[list[str]], k: int = 60) -> list[tuple[str, floa
 # Windows are eliminated entirely. A user's existing .env that names the
 # torch model (``cross-encoder/...``) keeps working — it's transparently
 # remapped here, so no config edit is required to migrate.
+#
+# NOTE: ``BAAI/bge-reranker-base`` is natively supported by fastembed (no map
+# entry needed — names not in this map pass through unchanged), but was
+# benchmarked and REJECTED for this corpus: MiniLM outperformed it on every
+# BEIR metric AND was 3.6x faster (see RerankerSettings docstring). Override
+# at your own risk via RERANKER_MODEL=BAAI/bge-reranker-base.
 _ONNX_RERANKER_MAP = {
     "cross-encoder/ms-marco-MiniLM-L-6-v2": "Xenova/ms-marco-MiniLM-L-6-v2",
 }
@@ -1012,12 +1026,37 @@ class RAGPipeline:
                 ranked_lists.append([r["chunk_id"] for r in f_rows])
 
             # RRF fusion -> candidate_k unique chunk_ids.
-            fused = rrf_fuse(ranked_lists)[:candidate_k]
+            fused = rrf_fuse(ranked_lists)
             if not fused:
                 return []
-            cand_ids = [cid for cid, _ in fused]
-            rrf_scores = {cid: sc for cid, sc in fused}
-            rows = {r["chunk_id"]: r for r in fetch_chunks_by_ids(conn, cand_ids)}
+
+            # Item-level dedup of the candidate pool BEFORE rerank. A single
+            # item can have many chunks in the pool (e.g. dozens of near-
+            # duplicate Test Cases whose names mirror the query), and without
+            # dedup they crowd out the authoritative Feature/Requirement item
+            # so it never reaches the reranker. Keep only the highest-RRF chunk
+            # per item_id, then take candidate_k unique items. This lets the
+            # reranker see a diverse candidate set instead of N copies of the
+            # same item. We need each chunk's item_id, so fetch metadata now.
+            # fused is sorted desc by RRF score, so first-seen-per-item wins.
+            need_ids = [cid for cid, _ in fused]
+            meta = {r["chunk_id"]: r for r in fetch_chunks_by_ids(conn, need_ids)}
+            seen_items: set[int] = set()
+            deduped_fused: list[tuple[str, float]] = []
+            for cid, sc in fused:
+                if cid not in meta:
+                    continue
+                item_id = meta[cid]["item_id"]
+                if item_id in seen_items:
+                    continue
+                seen_items.add(item_id)
+                deduped_fused.append((cid, sc))
+                if len(deduped_fused) >= candidate_k:
+                    break
+
+            cand_ids = [cid for cid, _ in deduped_fused]
+            rrf_scores = {cid: sc for cid, sc in deduped_fused}
+            rows = meta
 
             # Rerank.
             ordered = [cid for cid in cand_ids if cid in rows]
@@ -1038,35 +1077,57 @@ class RAGPipeline:
 
             scored = sorted(zip(ordered, rr_scores),
                             key=lambda x: x[1], reverse=True)
-            # Deduplicate by item_id: a single item can have multiple chunks
-            # (description + test_steps) in the candidate pool, and without
-            # dedup they'd occupy multiple top_k slots — wasting result
-            # slots on the same item when the user wants diverse items. Keep
-            # only the highest-scoring chunk per item_id.
-            seen_items: set[int] = set()
-            deduped: list[tuple[str, float]] = []
-            for cid, score in scored:
-                item_id = rows[cid]["item_id"]
-                if item_id in seen_items:
-                    continue
-                seen_items.add(item_id)
-                deduped.append((cid, score))
-                if len(deduped) >= top_k:
-                    break
+            # Final top_k trim. Item-level dedup already happened above
+            # (one chunk per item in the candidate pool), so each result
+            # slot now holds a distinct item — no redundant duplicates.
+            final = scored[:top_k]
             return [_row_to_result(rows[cid], score,
                                    "rerank" if used_rerank else "rrf")
-                    for cid, score in deduped if cid in rows]
+                    for cid, score in final if cid in rows]
         finally:
             conn.close()
 
 
+# English stopwords shared by the lexical Multi-Query expander and the FTS
+# query builder. Stripping them from FTS MATCH expressions prevents the
+# implicit-AND operator from turning "how does volume sync work" into a
+# requirement that a chunk contain ALL of {how, does, volume, sync, work} —
+# which matches nothing. Kept here as a module constant so both consumers
+# share the exact same list.
+_FTS_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "to", "in", "on", "for", "and", "or",
+    "is", "are", "be", "with", "that", "this", "it", "as", "by",
+    "how", "does", "do", "what", "which", "why", "when", "can",
+    "will", "should", "would", "could", "i", "we", "you",
+    "between", "from", "into", "over", "under", "about",
+})
+
+
 def _to_fts_query(query: str) -> str:
-    """Make a safe FTS5 MATCH expression (prefix + AND of terms)."""
+    """Build an OR FTS5 MATCH expression from a natural-language query.
+
+    Tokens are lowercased, stripped of English stopwords, and joined with the
+    explicit ``OR`` operator so a relevant chunk that mentions only a subset
+    of the query terms still enters the candidate pool. This is the correct
+    behaviour for **recall**: BM25 ranking (applied via ``ORDER BY bm25(...)``)
+    then surfaces high-overlap chunks, and the cross-encoder reranker handles
+    final precision. The prior implicit-AND + stopword-inclusive form matched
+    ~0 chunks for most natural-language queries, starving RRF fusion of
+    keyword-relevant candidates.
+
+    Each surviving token is quoted and prefix-matched (``"tok"*``) so partial
+    matches (e.g. ``"sync"*`` matching ``synchronization``) are found. Capped
+    at 20 tokens for query safety.
+    """
     tokens = re.findall(r"[A-Za-z0-9_]+", query)
-    if not tokens:
+    terms = [t for t in tokens if t.lower() not in _FTS_STOPWORDS]
+    if not terms:
+        # Fallback: if every token was a stopword, use the raw tokens so we
+        # don't return an empty match (which would silently drop FTS recall).
+        terms = tokens
+    if not terms:
         return ""
-    # Prefix terms enable partial matches; quoting avoids operator parsing.
-    return " ".join(f'"{t}"*' for t in tokens[:20])
+    return " OR ".join(f'"{t}"*' for t in terms[:20])
 
 
 def _row_to_result(row, score: float, strategy: str) -> dict:

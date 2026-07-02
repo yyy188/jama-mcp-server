@@ -331,17 +331,17 @@ def test_concurrent_sync(jama, project_id: int) -> None:
     conn = init_db()
     upsert_project(conn, project_id, status="NEW")
     with write_txn(conn):
-        conn.execute("DELETE FROM chunks WHERE project_id=?", (project_id,))
-        conn.execute("DELETE FROM chunks_fts WHERE project_id=?", (project_id,))
-        # Delete only THIS project's vectors. chunks_vec has no project_id
-        # column, so JOIN to chunks to scope the delete — an unconditional
-        # DELETE FROM chunks_vec would wipe ALL projects' vectors (a bug that
-        # silently destroyed Lyra's 8664-vector index every time selftest ran
-        # on the small test project 20186).
+        # Delete THIS project's vectors FIRST (while chunks rows still exist
+        # to scope the delete). chunks_vec has no project_id column, so we
+        # JOIN to chunks to scope — deleting chunks BEFORE this would empty
+        # the subquery and leave stale vectors behind, which then cause
+        # "UNIQUE constraint failed" on the next sync's INSERT into chunks_vec.
         conn.execute(
             "DELETE FROM chunks_vec WHERE chunk_id IN "
             "(SELECT chunk_id FROM chunks WHERE project_id=?)",
             (project_id,))
+        conn.execute("DELETE FROM chunks WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM chunks_fts WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM items WHERE project_id=?", (project_id,))
     import uuid as _uuid
     job_id = f"selftest-sync-{_uuid.uuid4().hex[:8]}"
@@ -386,15 +386,16 @@ def test_crash_recovery(project_id: int) -> None:
     # Simulate a crash: leave the project INITIALIZING with no chunks.
     upsert_project(conn, project_id, status="INITIALIZING")
     with write_txn(conn):
-        conn.execute("DELETE FROM chunks WHERE project_id=?", (project_id,))
-        conn.execute("DELETE FROM chunks_fts WHERE project_id=?", (project_id,))
-        # Delete only THIS project's vectors (not ALL projects' — see
-        # test_concurrent_sync for the same scoped-delete pattern).
+        # Delete THIS project's vectors FIRST (while chunks rows still exist
+        # to scope the delete) — see test_concurrent_sync for the rationale.
+        # Deleting chunks first would empty the scoping subquery and leave
+        # stale vectors that cause UNIQUE-constraint failures on next sync.
         conn.execute(
             "DELETE FROM chunks_vec WHERE chunk_id IN "
             "(SELECT chunk_id FROM chunks WHERE project_id=?)",
             (project_id,))
-        conn.execute("DELETE FROM items WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM chunks WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM chunks_fts WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM items WHERE project_id=?", (project_id,))
     before = get_project(conn, project_id)
     _tlog(f"crash recovery: project {project_id} left INITIALIZING; "

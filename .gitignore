@@ -58,5 +58,26 @@ selftest_*.log
 http_test.log
 sse_test.log
 
+# ====== Recall / precision benchmark logs ======
+recall_*.log
+baseline_beir.log
+bge_*.log
+
+# ====== Rebuild / backfill / init logs ======
+rebuild*.log
+backfill.log
+init_lyra*.log
+
+# ====== Recall / precision test + benchmark logs ======
+recall_*.log
+baseline_beir.log
+bench_*.log
+
+# ====== Reranker download / sync rebuild logs ======
+bge_*.log
+backfill.log
+rebuild*.log
+init_lyra*.log
+
 # ====== uv virtualenv (created by `uv sync`) ======
 .venv/

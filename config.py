@@ -175,11 +175,20 @@ class RerankerSettings:
     c10.dll/WinError 1114 load failure). A user's existing .env that names the
     torch model keeps working unchanged.
 
+    Model choice rationale: MiniLM was benchmarked against
+    ``BAAI/bge-reranker-base`` (~1.04GB) on the Lyra corpus (15 BEIR-style
+    curated queries). MiniLM won on every metric at candidate_k=25 —
+    Recall@5 33.3% vs 31.1%, MRR@5 0.439 vs 0.277, nDCG@5 0.467 vs 0.355 —
+    AND was 3.6x faster (1150ms vs 4164ms). bge-reranker-base is trained on
+    multilingual general data (XLM-RoBERTa); MiniLM is tuned specifically on
+    MS MARCO query-document pairs, which matches this corpus's "short query +
+    technical requirement chunk" pattern better. So the larger model is NOT
+    better here.
+
     RRF already fuses recall; the reranker only re-sorts the final 25
-    candidates, so the small MiniLM cross-encoder gives comparable precision to
-    the prior Qwen3-Reranker-0.6B at a fraction of the size. A cross-encoder
-    scores (query, document) pairs directly via a sequence-classification head
-    — no causal-LM prompt format, no large logits tensor.
+    candidates. A cross-encoder scores (query, document) pairs directly via a
+    sequence-classification head — no causal-LM prompt format, no large logits
+    tensor.
     """
     model_name: str = _get("RERANKER_MODEL",
                            "cross-encoder/ms-marco-MiniLM-L-6-v2")
